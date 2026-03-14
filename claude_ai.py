@@ -78,27 +78,33 @@ Return ONLY the JSON array. No other text."""}]
     return _parse_json(response.content[0].text)
 
 
-def raw_input_to_task(raw_text: str, project_name: str) -> dict:
-    """Convert free-form task input into a structured task dict.
+def raw_input_to_tasks(raw_text: str, project_name: str) -> list:
+    """Convert free-form task input into a list of structured task dicts.
 
-    Returns {title, description, tags}.
+    Handles both single tasks and numbered lists (e.g. "1. X  2. Y").
+    Returns list of {title, description, tags}.
     """
     response = client.messages.create(
         model=MODEL,
-        max_tokens=400,
+        max_tokens=800,
         messages=[{"role": "user", "content": f"""You are a productivity assistant.
-Convert this rough input into a structured task for the '{project_name}' project.
+Convert this rough input into one or more structured tasks for the '{project_name}' project.
 
 Input: {raw_text}
 
-Return ONLY a JSON object:
+Rules:
+- If the input contains numbered items (e.g. "1. ...", "2. ..."), create a separate task for each item.
+- Otherwise create a single task.
+- Extract any #hashtags into the tags field.
+
+Return ONLY a JSON array. Each item:
 {{
   "title": "short task title (max 60 chars)",
   "description": "extra detail or null",
-  "tags": "comma-separated tags extracted from #hashtags or empty string"
+  "tags": "comma-separated tags or empty string"
 }}
 
-Return ONLY the JSON. No other text."""}]
+Return ONLY the JSON array. No other text."""}]
     )
 
     return _parse_json(response.content[0].text)

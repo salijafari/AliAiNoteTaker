@@ -11,25 +11,27 @@ def get_conn():
     return conn
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def _table_exists(conn, table: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 def init_db():
     with get_conn() as conn:
+        # ── Create tables for fresh installs ──────────────────────────────────
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS projects (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    INTEGER NOT NULL,
                 name       TEXT    NOT NULL,
                 created_at TEXT    DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS notes (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id      INTEGER NOT NULL,
-                project_id   INTEGER NOT NULL,
-                raw_text     TEXT    NOT NULL,
-                refined_text TEXT    NOT NULL,
-                tags         TEXT    DEFAULT '',
-                created_at   TEXT    DEFAULT (datetime('now')),
-                FOREIGN KEY (project_id) REFERENCES projects(id)
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -45,10 +47,52 @@ def init_db():
                 reminded       INTEGER DEFAULT 0,
                 created_at     TEXT    DEFAULT (datetime('now')),
                 completed_at   TEXT,
-                FOREIGN KEY (project_id)     REFERENCES projects(id),
-                FOREIGN KEY (source_note_id) REFERENCES notes(id)
+                FOREIGN KEY (project_id) REFERENCES projects(id)
             );
         ''')
+
+        # ── Migrate notes table (old schema had single 'content' column) ───────
+        if _table_exists(conn, 'notes') and _column_exists(conn, 'notes', 'content') \
+                and not _column_exists(conn, 'notes', 'raw_text'):
+            # Rebuild with new schema, preserving existing data
+            conn.executescript('''
+                CREATE TABLE notes_new (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      INTEGER NOT NULL,
+                    project_id   INTEGER NOT NULL,
+                    raw_text     TEXT    NOT NULL DEFAULT '',
+                    refined_text TEXT    NOT NULL DEFAULT '',
+                    tags         TEXT    DEFAULT '',
+                    created_at   TEXT    DEFAULT (datetime('now')),
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+                INSERT INTO notes_new (id, user_id, project_id, raw_text, refined_text, tags, created_at)
+                SELECT id, user_id, project_id, content, content, '', created_at FROM notes;
+                DROP TABLE notes;
+                ALTER TABLE notes_new RENAME TO notes;
+            ''')
+        elif not _table_exists(conn, 'notes'):
+            conn.executescript('''
+                CREATE TABLE notes (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      INTEGER NOT NULL,
+                    project_id   INTEGER NOT NULL,
+                    raw_text     TEXT    NOT NULL,
+                    refined_text TEXT    NOT NULL,
+                    tags         TEXT    DEFAULT '',
+                    created_at   TEXT    DEFAULT (datetime('now')),
+                    FOREIGN KEY (project_id) REFERENCES projects(id)
+                );
+            ''')
+
+        # ── Migrate tasks table (add columns missing from old schema) ──────────
+        for col, definition in [
+            ("source_note_id", "INTEGER"),
+            ("tags",           "TEXT DEFAULT ''"),
+            ("completed_at",   "TEXT"),
+        ]:
+            if not _column_exists(conn, 'tasks', col):
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────

@@ -248,13 +248,13 @@ async def task_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if query.data == "picknote_done":
         selected_ids = context.user_data.get(_NOTE_IDS, [])
         if not selected_ids:
             await query.answer("Select at least one note first.", show_alert=True)
             return TASK_PICK_NOTES
+        await query.answer()
 
         user_id    = query.from_user.id
         project_id = context.user_data[_PROJECT_ID]
@@ -284,6 +284,7 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Toggle a note
+    await query.answer()
     note_id = int(query.data.split("_")[1])
     selected = context.user_data.setdefault(_NOTE_IDS, [])
     if note_id in selected:
@@ -318,24 +319,22 @@ async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✨ Building your task…")
 
     try:
-        result = ai.raw_input_to_task(raw_text, project["name"])
+        results = ai.raw_input_to_tasks(raw_text, project["name"])
+        if not isinstance(results, list):
+            results = [results]
     except Exception as e:
-        logger.error(f"raw_input_to_task error: {e}")
-        result = {"title": raw_text[:60], "description": None, "tags": ""}
+        logger.error(f"raw_input_to_tasks error: {e}")
+        results = [{"title": raw_text[:60], "description": None, "tags": ""}]
 
-    tags = result.get("tags") or ai.extract_hashtags(raw_text)
-    task_id = db.add_task(
-        user_id, project_id,
-        result["title"], result.get("description"), tags
-    )
+    saved_lines = []
+    for result in results:
+        tags = result.get("tags") or ai.extract_hashtags(raw_text)
+        db.add_task(user_id, project_id, result["title"], result.get("description"), tags)
+        tag_line = f" 🏷 {tags}" if tags else ""
+        saved_lines.append(f"• *{result['title']}*{tag_line}")
 
-    tag_line = f"\n🏷 Tags: {tags}" if tags else ""
-    desc_line = f"\n_{result['description']}_" if result.get("description") else ""
-    await update.message.reply_text(
-        f"✅ *Task saved to {project['name']}*\n\n"
-        f"*{result['title']}*{desc_line}{tag_line}",
-        parse_mode="Markdown",
-    )
+    reply = f"✅ *{len(results)} task(s) saved to {project['name']}*\n\n" + "\n".join(saved_lines)
+    await update.message.reply_text(reply, parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -665,6 +664,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
+        allow_reentry=True,
     )
 
     # /task conversation
@@ -679,6 +679,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
+        allow_reentry=True,
     )
 
     # /project conversation
@@ -694,6 +695,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
