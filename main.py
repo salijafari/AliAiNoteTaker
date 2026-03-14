@@ -38,13 +38,15 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     PROJECT_PICK,
     PROJECT_ACTION,
     NEWPROJECT_AWAIT_NAME,
-) = range(9)
+    TASK_REVIEW_SUGGESTED,
+) = range(10)
 
 # Keys stored in context.user_data during flows
-_FLOW        = "flow"           # "note" | "task_new" | "task_convert" | "project"
-_PROJECT_ID  = "flow_project_id"
-_PENDING     = "pending_tasks"
-_NOTE_IDS    = "selected_note_ids"
+_FLOW           = "flow"
+_PROJECT_ID     = "flow_project_id"
+_PENDING        = "pending_tasks"
+_NOTE_IDS       = "selected_note_ids"
+_SUGGESTED_IDS  = "selected_suggested_ids"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -68,10 +70,11 @@ def _fmt_note(note: dict, show_raw: bool = False) -> str:
 
 
 def _fmt_task(task: dict) -> str:
-    tags = f"  🏷 {task['tags']}" if task.get("tags") else ""
-    ts   = task["created_at"][:16]
-    desc = f"\n   _{task['description']}_" if task.get("description") else ""
-    return f"*#{task['id']}* {task['title']}{desc}\n_{ts}{tags}_"
+    tags     = f"  🏷 {task['tags']}" if task.get("tags") else ""
+    ts       = task["created_at"][:10]
+    desc     = f"\n   _{task['description']}_" if task.get("description") else ""
+    deadline = f"\n   📅 Due: {task['deadline']}" if task.get("deadline") else ""
+    return f"*#{task['id']}* {task['title']}{desc}{deadline}\n_{ts}{tags}_"
 
 
 async def _send_project_picker(update_or_query, user_id: int, prompt: str):
@@ -194,8 +197,9 @@ async def task_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data[_PROJECT_ID] = project_id
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Write a new task", callback_data="taskmode_new")],
-        [InlineKeyboardButton("🔄 Convert existing notes",  callback_data="taskmode_convert")],
+        [InlineKeyboardButton("✏️ Write a new task",        callback_data="taskmode_new")],
+        [InlineKeyboardButton("🔄 Generate from notes",     callback_data="taskmode_convert")],
+        [InlineKeyboardButton("📋 View existing tasks",     callback_data="taskmode_view")],
     ])
     await query.edit_message_text(
         f"📂 *{project['name']}* — what would you like to do?",
@@ -206,38 +210,52 @@ async def task_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def task_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query      = update.callback_query
     await query.answer()
+    user_id    = query.from_user.id
+    project_id = context.user_data[_PROJECT_ID]
+    project    = db.get_project(project_id, user_id)
 
     if query.data == "taskmode_new":
         await query.edit_message_text(
-            "✏️ *Describe your task:*\n_Hashtags like #design will be saved as tags._",
+            f"✏️ *New task for {project['name']}:*\n"
+            "_Hashtags like #design will be saved as tags._\n"
+            "_Mention a date (e.g. 'by Friday') to set a deadline._",
             parse_mode="Markdown",
         )
         return TASK_AWAIT_TEXT
 
-    # Convert mode — show notes to pick from
-    user_id    = query.from_user.id
-    project_id = context.user_data[_PROJECT_ID]
-    notes      = db.get_notes(user_id, project_id, limit=10)
+    if query.data == "taskmode_view":
+        tasks = db.get_tasks(user_id, project_id)
+        if not tasks:
+            await query.edit_message_text(
+                f"🎉 No pending tasks in *{project['name']}* yet.",
+                parse_mode="Markdown",
+            )
+            return ConversationHandler.END
+        text = f"✅ *Pending tasks — {project['name']}:*\n\n"
+        kb   = []
+        for t in tasks:
+            text += _fmt_task(t) + "\n\n"
+            kb.append([InlineKeyboardButton(f"✅ Done #{t['id']}", callback_data=f"done_{t['id']}")])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
 
+    # Generate from notes — show note picker
+    notes = db.get_notes(user_id, project_id, limit=10)
     if not notes:
         await query.edit_message_text(
             "📭 No notes in this project yet. Add some with /note first!"
         )
         return ConversationHandler.END
 
-    context.user_data[_NOTE_IDS] = []
+    context.user_data[_NOTE_IDS]     = []
+    context.user_data["notes_cache"] = {n["id"]: n for n in notes}
     kb = [
-        [InlineKeyboardButton(
-            f"{'☑️' if False else '⬜'} {n['refined_text'][:50]}",
-            callback_data=f"picknote_{n['id']}"
-        )]
+        [InlineKeyboardButton(f"⬜ {n['refined_text'][:50]}", callback_data=f"picknote_{n['id']}")]
         for n in notes
     ]
     kb.append([InlineKeyboardButton("✅ Convert selected notes", callback_data="picknote_done")])
-    context.user_data["notes_cache"] = {n["id"]: n for n in notes}
-
     await query.edit_message_text(
         "📋 *Select notes to convert into tasks:*\n_Tap to toggle, then press Convert._",
         parse_mode="Markdown",
@@ -271,17 +289,20 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Something went wrong. Please try again.")
             return ConversationHandler.END
 
-        context.user_data[_PENDING] = tasks
-        text = f"🎯 *{len(tasks)} suggested tasks for {project['name']}:*\n\n"
+        context.user_data[_PENDING]       = tasks
+        context.user_data[_SUGGESTED_IDS] = list(range(len(tasks)))  # all selected by default
+
+        text = f"🎯 *Claude found {len(tasks)} tasks for {project['name']}:*\n_Tap to deselect, then save._\n\n"
         kb   = []
         for i, t in enumerate(tasks):
+            deadline_str = f"  📅 {t['deadline']}" if t.get("deadline") else ""
             desc = f"\n   _{t['description']}_" if t.get("description") else ""
-            text += f"*{i+1}.* {t['title']}{desc}\n\n"
-            kb.append([InlineKeyboardButton(f"💾 Save #{i+1}", callback_data=f"savetask_{i}")])
-        kb.append([InlineKeyboardButton("💾 Save ALL", callback_data="savetask_all")])
+            text += f"*{i+1}.* {t['title']}{deadline_str}{desc}\n\n"
+            kb.append([InlineKeyboardButton(f"☑️ {t['title'][:45]}{deadline_str}", callback_data=f"stask_{i}")])
+        kb.append([InlineKeyboardButton("💾 Save selected tasks", callback_data="stask_done")])
 
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
+        return TASK_REVIEW_SUGGESTED
 
     # Toggle a note
     await query.answer()
@@ -306,6 +327,54 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return TASK_PICK_NOTES
 
 
+async def task_suggested_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if query.data == "stask_done":
+        selected_idxs = context.user_data.get(_SUGGESTED_IDS, [])
+        if not selected_idxs:
+            await query.answer("Select at least one task first.", show_alert=True)
+            return TASK_REVIEW_SUGGESTED
+        await query.answer()
+
+        user_id    = query.from_user.id
+        project_id = context.user_data[_PROJECT_ID]
+        pending    = context.user_data.get(_PENDING, [])
+
+        for idx in sorted(selected_idxs):
+            if idx < len(pending):
+                t = pending[idx]
+                db.add_task(
+                    user_id, project_id, t["title"],
+                    t.get("description"), t.get("tags", ""),
+                    t.get("source_note_id"), t.get("deadline")
+                )
+        await query.edit_message_text(f"💾 *{len(selected_idxs)} task(s) saved!*", parse_mode="Markdown")
+        return ConversationHandler.END
+
+    # Toggle a suggested task
+    await query.answer()
+    idx      = int(query.data.split("_")[1])
+    selected = context.user_data.setdefault(_SUGGESTED_IDS, [])
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+    pending = context.user_data.get(_PENDING, [])
+    kb = []
+    for i, t in enumerate(pending):
+        deadline_str = f"  📅 {t['deadline']}" if t.get("deadline") else ""
+        checked = i in selected
+        kb.append([InlineKeyboardButton(
+            f"{'☑️' if checked else '⬜'} {t['title'][:45]}{deadline_str}",
+            callback_data=f"stask_{i}"
+        )])
+    kb.append([InlineKeyboardButton("💾 Save selected tasks", callback_data="stask_done")])
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+    return TASK_REVIEW_SUGGESTED
+
+
 async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id    = update.effective_user.id
     raw_text   = update.message.text.strip()
@@ -328,44 +397,17 @@ async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     saved_lines = []
     for result in results:
-        tags = result.get("tags") or ai.extract_hashtags(raw_text)
-        db.add_task(user_id, project_id, result["title"], result.get("description"), tags)
-        tag_line = f" 🏷 {tags}" if tags else ""
-        saved_lines.append(f"• *{result['title']}*{tag_line}")
+        tags     = result.get("tags") or ai.extract_hashtags(raw_text)
+        deadline = result.get("deadline")
+        db.add_task(user_id, project_id, result["title"], result.get("description"), tags,
+                    deadline=deadline)
+        tag_line      = f" 🏷 {tags}" if tags else ""
+        deadline_line = f" 📅 {deadline}" if deadline else ""
+        saved_lines.append(f"• *{result['title']}*{deadline_line}{tag_line}")
 
     reply = f"✅ *{len(results)} task(s) saved to {project['name']}*\n\n" + "\n".join(saved_lines)
     await update.message.reply_text(reply, parse_mode="Markdown")
     return ConversationHandler.END
-
-
-# ── Save-task callback (from convert flow) ────────────────────────────────────
-
-async def save_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    await query.answer()
-    user_id    = query.from_user.id
-    project_id = context.user_data.get(_PROJECT_ID)
-    pending    = context.user_data.get(_PENDING, [])
-    which      = query.data.split("_")[1]
-
-    def _save(t):
-        return db.add_task(
-            user_id, project_id, t["title"],
-            t.get("description"), t.get("tags", ""),
-            t.get("source_note_id")
-        )
-
-    if which == "all":
-        for t in pending:
-            _save(t)
-        await query.edit_message_text(f"💾 All {len(pending)} tasks saved!")
-    else:
-        idx = int(which)
-        if idx < len(pending):
-            _save(pending[idx])
-            await query.edit_message_text(
-                f"💾 Saved: *{pending[idx]['title']}*", parse_mode="Markdown"
-            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -533,8 +575,9 @@ async def newproject_receive_name(update: Update, context: ContextTypes.DEFAULT_
 
     if after == "task":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Write a new task",       callback_data="taskmode_new")],
-            [InlineKeyboardButton("🔄 Convert existing notes", callback_data="taskmode_convert")],
+            [InlineKeyboardButton("✏️ Write a new task",    callback_data="taskmode_new")],
+            [InlineKeyboardButton("🔄 Generate from notes", callback_data="taskmode_convert")],
+            [InlineKeyboardButton("📋 View existing tasks", callback_data="taskmode_view")],
         ])
         await update.message.reply_text(
             f"📂 *{name}* — what would you like to do?",
@@ -611,9 +654,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rawnote_"):
         await show_raw_note(update, context)
 
-    elif data.startswith("savetask_"):
-        await save_task_callback(update, context)
-
 
 # ── Reminders job ─────────────────────────────────────────────────────────────
 
@@ -634,6 +674,25 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             db.mark_reminded(task["id"])
         except Exception as e:
             logger.error(f"Reminder error task {task['id']}: {e}")
+
+
+async def check_deadline_reminders(context: ContextTypes.DEFAULT_TYPE):
+    for task in db.get_approaching_deadlines():
+        try:
+            await context.bot.send_message(
+                chat_id=task["user_id"],
+                text=(
+                    f"📅 *Deadline tomorrow!*\n\n"
+                    f"📂 {task['project_name']}\n"
+                    f"📌 *{task['title']}*\n"
+                    f"🗓 Due: {task['deadline']}\n"
+                    f"\n_Use /task to manage it._"
+                ),
+                parse_mode="Markdown",
+            )
+            db.mark_deadline_reminded(task["id"])
+        except Exception as e:
+            logger.error(f"Deadline reminder error task {task['id']}: {e}")
 
 
 # ── Bot command registration ──────────────────────────────────────────────────
@@ -671,11 +730,12 @@ def main():
     task_conv = ConversationHandler(
         entry_points=[CommandHandler("task", task_entry)],
         states={
-            TASK_PICK_PROJECT: [CallbackQueryHandler(task_project_chosen, pattern=r"^proj_")],
-            TASK_PICK_MODE:    [CallbackQueryHandler(task_mode_chosen, pattern=r"^taskmode_")],
-            TASK_AWAIT_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
-            TASK_PICK_NOTES:   [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
-            NEWPROJECT_AWAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
+            TASK_PICK_PROJECT:    [CallbackQueryHandler(task_project_chosen, pattern=r"^proj_")],
+            TASK_PICK_MODE:       [CallbackQueryHandler(task_mode_chosen, pattern=r"^taskmode_")],
+            TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
+            TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
+            TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
@@ -686,12 +746,13 @@ def main():
     project_conv = ConversationHandler(
         entry_points=[CommandHandler("project", project_entry)],
         states={
-            PROJECT_PICK:   [CallbackQueryHandler(project_picked, pattern=r"^proj_")],
-            PROJECT_ACTION: [CallbackQueryHandler(project_action, pattern=r"^paction_")],
-            NOTE_AWAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
-            TASK_AWAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
-            TASK_PICK_NOTES: [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
-            NEWPROJECT_AWAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
+            PROJECT_PICK:         [CallbackQueryHandler(project_picked, pattern=r"^proj_")],
+            PROJECT_ACTION:       [CallbackQueryHandler(project_action, pattern=r"^paction_")],
+            NOTE_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
+            TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
+            TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
+            TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
@@ -707,6 +768,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.job_queue.run_repeating(check_reminders, interval=60, first=15)
+    app.job_queue.run_repeating(check_deadline_reminders, interval=3600, first=30)
 
     logger.info("🤖 Bot started!")
     app.run_polling(drop_pending_updates=True)
