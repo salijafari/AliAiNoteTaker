@@ -1,8 +1,19 @@
 import sqlite3
 from datetime import datetime
 import os
+import logging
 
-DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+logger = logging.getLogger(__name__)
+
+
+def _default_db_path():
+    # Railway / Render / Fly: if a persistent volume is mounted at /data, use it
+    if os.path.isdir("/data"):
+        return "/data/bot_data.db"
+    return "bot_data.db"
+
+
+DB_PATH = os.getenv("DB_PATH", _default_db_path())
 
 
 def get_conn():
@@ -24,6 +35,7 @@ def _table_exists(conn, table: str) -> bool:
 
 
 def init_db():
+    logger.info(f"Database path: {DB_PATH}")
     with get_conn() as conn:
         # ── Create tables for fresh installs ──────────────────────────────────
         conn.executescript('''
@@ -185,6 +197,25 @@ def complete_task(task_id: int, user_id: int):
             "UPDATE tasks SET status = 'completed', completed_at = datetime('now') "
             "WHERE id = ? AND user_id = ?",
             (task_id, user_id)
+        )
+
+
+def update_task_content(task_id: int, user_id: int, title: str,
+                        description: str = None, tags: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tasks SET title = ?, description = ?, tags = ? "
+            "WHERE id = ? AND user_id = ?",
+            (title, description, tags, task_id, user_id)
+        )
+
+
+def update_task_deadline(task_id: int, user_id: int, deadline: str | None):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tasks SET deadline = ?, deadline_reminded = 0 "
+            "WHERE id = ? AND user_id = ?",
+            (deadline, task_id, user_id)
         )
 
 
