@@ -35,18 +35,20 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id        INTEGER NOT NULL,
-                project_id     INTEGER NOT NULL,
-                source_note_id INTEGER,
-                title          TEXT    NOT NULL,
-                description    TEXT,
-                tags           TEXT    DEFAULT '',
-                status         TEXT    DEFAULT 'pending',
-                reminder_at    TEXT,
-                reminded       INTEGER DEFAULT 0,
-                created_at     TEXT    DEFAULT (datetime('now')),
-                completed_at   TEXT,
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id           INTEGER NOT NULL,
+                project_id        INTEGER NOT NULL,
+                source_note_id    INTEGER,
+                title             TEXT    NOT NULL,
+                description       TEXT,
+                tags              TEXT    DEFAULT '',
+                status            TEXT    DEFAULT 'pending',
+                reminder_at       TEXT,
+                reminded          INTEGER DEFAULT 0,
+                deadline          TEXT,
+                deadline_reminded INTEGER DEFAULT 0,
+                created_at        TEXT    DEFAULT (datetime('now')),
+                completed_at      TEXT,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             );
         ''')
@@ -87,9 +89,11 @@ def init_db():
 
         # ── Migrate tasks table (add columns missing from old schema) ──────────
         for col, definition in [
-            ("source_note_id", "INTEGER"),
-            ("tags",           "TEXT DEFAULT ''"),
-            ("completed_at",   "TEXT"),
+            ("source_note_id",    "INTEGER"),
+            ("tags",              "TEXT DEFAULT ''"),
+            ("completed_at",      "TEXT"),
+            ("deadline",          "TEXT"),
+            ("deadline_reminded", "INTEGER DEFAULT 0"),
         ]:
             if not _column_exists(conn, 'tasks', col):
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
@@ -156,12 +160,12 @@ def get_note(note_id: int, user_id: int):
 
 def add_task(user_id: int, project_id: int, title: str,
              description: str = None, tags: str = "",
-             source_note_id: int = None) -> int:
+             source_note_id: int = None, deadline: str = None) -> int:
     with get_conn() as conn:
         cur = conn.execute("""
-            INSERT INTO tasks (user_id, project_id, title, description, tags, source_note_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, project_id, title, description, tags, source_note_id))
+            INSERT INTO tasks (user_id, project_id, title, description, tags, source_note_id, deadline)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, project_id, title, description, tags, source_note_id, deadline))
         return cur.lastrowid
 
 
@@ -208,3 +212,22 @@ def get_due_reminders():
 def mark_reminded(task_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE tasks SET reminded = 1 WHERE id = ?", (task_id,))
+
+
+def get_approaching_deadlines():
+    """Return pending tasks whose deadline is tomorrow and haven't been deadline-reminded."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT t.*, p.name AS project_name
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.deadline = date('now', '+1 day')
+              AND t.status = 'pending'
+              AND t.deadline_reminded = 0
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_deadline_reminded(task_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE tasks SET deadline_reminded = 1 WHERE id = ?", (task_id,))

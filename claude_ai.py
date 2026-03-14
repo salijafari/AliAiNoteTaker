@@ -69,7 +69,8 @@ Return ONLY a JSON array. Each item:
   "title": "short task title (max 60 chars)",
   "description": "extra detail or null",
   "tags": "comma-separated tags or empty string",
-  "source_note_id": <integer note_id or null>
+  "source_note_id": <integer note_id or null>,
+  "deadline": "YYYY-MM-DD if a due date is mentioned, otherwise null"
 }}
 
 Return ONLY the JSON array. No other text."""}]
@@ -101,7 +102,8 @@ Return ONLY a JSON array. Each item:
 {{
   "title": "short task title (max 60 chars)",
   "description": "extra detail or null",
-  "tags": "comma-separated tags or empty string"
+  "tags": "comma-separated tags or empty string",
+  "deadline": "YYYY-MM-DD if a due date is mentioned, otherwise null"
 }}
 
 Return ONLY the JSON array. No other text."""}]
