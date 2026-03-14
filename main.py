@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -493,10 +493,22 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start",      "Show welcome screen and available commands"),
+        BotCommand("note",       "Save a quick note — /note your thought here"),
+        BotCommand("notes",      "View recent notes in the active project"),
+        BotCommand("tasks",      "View and manage pending tasks"),
+        BotCommand("convert",    "Let Claude turn your notes into tasks"),
+        BotCommand("projects",   "List projects and switch the active one"),
+        BotCommand("newproject", "Create a new project — /newproject Name"),
+    ])
+
+
 def main():
     db.init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
