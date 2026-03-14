@@ -39,7 +39,10 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     PROJECT_ACTION,
     NEWPROJECT_AWAIT_NAME,
     TASK_REVIEW_SUGGESTED,
-) = range(10)
+    TASK_VIEW_LIST,
+    TASK_EDIT_CONTENT,
+    TASK_EDIT_DEADLINE,
+) = range(13)
 
 # Keys stored in context.user_data during flows
 _FLOW           = "flow"
@@ -47,6 +50,7 @@ _PROJECT_ID     = "flow_project_id"
 _PENDING        = "pending_tasks"
 _NOTE_IDS       = "selected_note_ids"
 _SUGGESTED_IDS  = "selected_suggested_ids"
+_EDIT_TASK_ID   = "edit_task_id"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -226,20 +230,9 @@ async def task_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return TASK_AWAIT_TEXT
 
     if query.data == "taskmode_view":
-        tasks = db.get_tasks(user_id, project_id)
-        if not tasks:
-            await query.edit_message_text(
-                f"🎉 No pending tasks in *{project['name']}* yet.",
-                parse_mode="Markdown",
-            )
-            return ConversationHandler.END
-        text = f"✅ *Pending tasks — {project['name']}:*\n\n"
-        kb   = []
-        for t in tasks:
-            text += _fmt_task(t) + "\n\n"
-            kb.append([InlineKeyboardButton(f"✅ Done #{t['id']}", callback_data=f"done_{t['id']}")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
+        async def _edit(text, reply_markup=None):
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        return await _show_tasks(_edit, user_id, project_id)
 
     # Generate from notes — show note picker
     notes = db.get_notes(user_id, project_id, limit=10)
@@ -410,6 +403,186 @@ async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Task view / edit / deadline ───────────────────────────────────────────────
+
+def _build_task_list_kb(tasks):
+    """Build inline keyboard with Done + Edit buttons for each task."""
+    kb = []
+    for t in tasks:
+        kb.append([
+            InlineKeyboardButton(f"✅ Done", callback_data=f"tv_done_{t['id']}"),
+            InlineKeyboardButton(f"✏️ Edit", callback_data=f"tv_edit_{t['id']}"),
+        ])
+    return kb
+
+
+async def _show_tasks(send_fn, user_id, project_id, header=""):
+    """Fetch pending tasks and call send_fn(text, reply_markup). Returns the state."""
+    project = db.get_project(project_id, user_id)
+    tasks   = db.get_tasks(user_id, project_id)
+    if not tasks:
+        await send_fn(
+            f"{header}🎉 All tasks in *{project['name']}* are done!",
+            reply_markup=None,
+        )
+        return ConversationHandler.END
+    text = f"{header}✅ *Pending tasks — {project['name']}:*\n\n"
+    for t in tasks:
+        text += _fmt_task(t) + "\n\n"
+    kb = _build_task_list_kb(tasks)
+    await send_fn(text, reply_markup=InlineKeyboardMarkup(kb))
+    return TASK_VIEW_LIST
+
+
+async def task_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query      = update.callback_query
+    user_id    = query.from_user.id
+    project_id = context.user_data.get(_PROJECT_ID)
+    data       = query.data
+
+    async def _edit(text, reply_markup=None):
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    # ── Mark done ──
+    if data.startswith("tv_done_"):
+        await query.answer("Marked as done!")
+        task_id = int(data.split("_")[2])
+        db.complete_task(task_id, user_id)
+        return await _show_tasks(_edit, user_id, project_id)
+
+    # ── Edit sub-menu ──
+    if data.startswith("tv_edit_"):
+        await query.answer()
+        task_id = int(data.split("_")[2])
+        context.user_data[_EDIT_TASK_ID] = task_id
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Edit content",    callback_data=f"tv_ec_{task_id}")],
+            [InlineKeyboardButton("📅 Change deadline",  callback_data=f"tv_dl_{task_id}")],
+            [InlineKeyboardButton("◀️ Back to tasks",    callback_data="tv_back")],
+        ])
+        await _edit(f"✏️ *Editing task #{task_id}* — what do you want to change?", reply_markup=kb)
+        return TASK_VIEW_LIST
+
+    # ── Prompt for new content ──
+    if data.startswith("tv_ec_"):
+        await query.answer()
+        task_id = int(data.split("_")[2])
+        context.user_data[_EDIT_TASK_ID] = task_id
+        await _edit(
+            f"📝 *Type the updated content for task #{task_id}:*\n"
+            "_Hashtags and deadlines will be extracted automatically._"
+        )
+        return TASK_EDIT_CONTENT
+
+    # ── Deadline sub-menu ──
+    if data.startswith("tv_dl_"):
+        await query.answer()
+        task_id   = int(data.split("_")[2])
+        context.user_data[_EDIT_TASK_ID] = task_id
+        tomorrow  = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        next_week = (datetime.now() + timedelta(weeks=1)).strftime("%Y-%m-%d")
+        two_weeks = (datetime.now() + timedelta(weeks=2)).strftime("%Y-%m-%d")
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"Tomorrow ({tomorrow})",   callback_data=f"tv_sd_{task_id}_{tomorrow}"),
+                InlineKeyboardButton(f"Next week ({next_week})", callback_data=f"tv_sd_{task_id}_{next_week}"),
+            ],
+            [
+                InlineKeyboardButton(f"2 weeks ({two_weeks})",   callback_data=f"tv_sd_{task_id}_{two_weeks}"),
+                InlineKeyboardButton("✏️ Custom date",           callback_data=f"tv_cd_{task_id}"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Remove deadline", callback_data=f"tv_rd_{task_id}"),
+                InlineKeyboardButton("◀️ Back",            callback_data="tv_back"),
+            ],
+        ])
+        await _edit(f"📅 *Set deadline for task #{task_id}:*", reply_markup=kb)
+        return TASK_VIEW_LIST
+
+    # ── Set deadline from button ──
+    if data.startswith("tv_sd_"):
+        await query.answer()
+        parts    = data.split("_")
+        task_id  = int(parts[2])
+        deadline = parts[3]
+        db.update_task_deadline(task_id, user_id, deadline)
+        return await _show_tasks(_edit, user_id, project_id, header=f"📅 Deadline set to {deadline}.\n\n")
+
+    # ── Custom deadline (text input) ──
+    if data.startswith("tv_cd_"):
+        await query.answer()
+        task_id = int(data.split("_")[2])
+        context.user_data[_EDIT_TASK_ID] = task_id
+        await _edit(f"📅 *Type the deadline for task #{task_id}:*\n_(Format: YYYY-MM-DD)_")
+        return TASK_EDIT_DEADLINE
+
+    # ── Remove deadline ──
+    if data.startswith("tv_rd_"):
+        await query.answer()
+        task_id = int(data.split("_")[2])
+        db.update_task_deadline(task_id, user_id, None)
+        return await _show_tasks(_edit, user_id, project_id, header="🗑 Deadline removed.\n\n")
+
+    # ── Back to list ──
+    if data == "tv_back":
+        await query.answer()
+        return await _show_tasks(_edit, user_id, project_id)
+
+    await query.answer()
+    return TASK_VIEW_LIST
+
+
+async def task_edit_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id    = update.effective_user.id
+    raw_text   = update.message.text.strip()
+    task_id    = context.user_data.get(_EDIT_TASK_ID)
+    project_id = context.user_data.get(_PROJECT_ID)
+
+    if not task_id or not project_id:
+        await update.message.reply_text("Something went wrong. Use /task to start again.")
+        return ConversationHandler.END
+
+    project = db.get_project(project_id, user_id)
+    await update.message.reply_text("✨ Updating task…")
+
+    try:
+        results = ai.raw_input_to_tasks(raw_text, project["name"])
+        if not isinstance(results, list):
+            results = [results]
+        result = results[0]
+    except Exception as e:
+        logger.error(f"edit task error: {e}")
+        result = {"title": raw_text[:60], "description": None, "tags": ""}
+
+    tags = result.get("tags") or ai.extract_hashtags(raw_text)
+    db.update_task_content(task_id, user_id, result["title"], result.get("description"), tags)
+    if result.get("deadline"):
+        db.update_task_deadline(task_id, user_id, result["deadline"])
+
+    async def _reply(text, reply_markup=None):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    return await _show_tasks(_reply, user_id, project_id, header=f"✅ Task #{task_id} updated.\n\n")
+
+
+async def task_edit_deadline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id    = update.effective_user.id
+    raw_text   = update.message.text.strip()
+    task_id    = context.user_data.get(_EDIT_TASK_ID)
+    project_id = context.user_data.get(_PROJECT_ID)
+
+    if not task_id or not project_id:
+        await update.message.reply_text("Something went wrong. Use /task to start again.")
+        return ConversationHandler.END
+
+    db.update_task_deadline(task_id, user_id, raw_text)
+
+    async def _reply(text, reply_markup=None):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    return await _show_tasks(_reply, user_id, project_id, header=f"📅 Deadline for task #{task_id} set to {raw_text}.\n\n")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # /project  flow
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,23 +650,9 @@ async def project_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if action == "paction_tasks":
-        tasks = db.get_tasks(user_id, project_id)
-        if not tasks:
-            await query.edit_message_text(
-                f"🎉 No pending tasks in *{project['name']}*.", parse_mode="Markdown"
-            )
-            return ConversationHandler.END
-
-        text = f"✅ *Pending tasks — {project['name']}:*\n\n"
-        kb   = []
-        for t in tasks:
-            text += _fmt_task(t) + "\n\n"
-            kb.append([
-                InlineKeyboardButton(f"✅ Done #{t['id']}", callback_data=f"done_{t['id']}"),
-                InlineKeyboardButton(f"⏰ Remind #{t['id']}", callback_data=f"remind_{t['id']}"),
-            ])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
+        async def _edit(text, reply_markup=None):
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        return await _show_tasks(_edit, user_id, project_id)
 
     if action == "paction_addnote":
         await query.edit_message_text(
@@ -735,6 +894,9 @@ def main():
             TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
             TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
             TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            TASK_VIEW_LIST:      [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
+            TASK_EDIT_CONTENT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
+            TASK_EDIT_DEADLINE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
             NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
@@ -752,6 +914,9 @@ def main():
             TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
             TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
             TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            TASK_VIEW_LIST:      [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
+            TASK_EDIT_CONTENT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
+            TASK_EDIT_DEADLINE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
             NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
