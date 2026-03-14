@@ -15,77 +15,43 @@ def init_db():
     with get_conn() as conn:
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                name       TEXT    NOT NULL,
+                created_at TEXT    DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                project_id INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')),
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                project_id   INTEGER NOT NULL,
+                raw_text     TEXT    NOT NULL,
+                refined_text TEXT    NOT NULL,
+                tags         TEXT    DEFAULT '',
+                created_at   TEXT    DEFAULT (datetime('now')),
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                project_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT,
-                status TEXT DEFAULT 'pending',
-                reminder_at TEXT,
-                reminded INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (project_id) REFERENCES projects(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                active_project_id INTEGER,
-                FOREIGN KEY (active_project_id) REFERENCES projects(id)
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id        INTEGER NOT NULL,
+                project_id     INTEGER NOT NULL,
+                source_note_id INTEGER,
+                title          TEXT    NOT NULL,
+                description    TEXT,
+                tags           TEXT    DEFAULT '',
+                status         TEXT    DEFAULT 'pending',
+                reminder_at    TEXT,
+                reminded       INTEGER DEFAULT 0,
+                created_at     TEXT    DEFAULT (datetime('now')),
+                completed_at   TEXT,
+                FOREIGN KEY (project_id)     REFERENCES projects(id),
+                FOREIGN KEY (source_note_id) REFERENCES notes(id)
             );
         ''')
 
 
-def ensure_user(user_id: int):
-    with get_conn() as conn:
-        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-
-
-def get_active_project(user_id: int):
-    with get_conn() as conn:
-        row = conn.execute("""
-            SELECT p.* FROM users u
-            JOIN projects p ON p.id = u.active_project_id
-            WHERE u.user_id = ?
-        """, (user_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def set_active_project(user_id: int, project_id: int):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET active_project_id = ? WHERE user_id = ?",
-            (project_id, user_id)
-        )
-
-
-def create_project(user_id: int, name: str) -> int:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO projects (user_id, name) VALUES (?, ?)", (user_id, name)
-        )
-        project_id = cur.lastrowid
-        conn.execute(
-            "UPDATE users SET active_project_id = ? WHERE user_id = ?",
-            (project_id, user_id)
-        )
-        return project_id
-
+# ── Projects ──────────────────────────────────────────────────────────────────
 
 def get_projects(user_id: int):
     with get_conn() as conn:
@@ -95,16 +61,36 @@ def get_projects(user_id: int):
         return [dict(r) for r in rows]
 
 
-def add_note(user_id: int, project_id: int, content: str) -> int:
+def get_project(project_id: int, user_id: int):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_project(user_id: int, name: str) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO notes (user_id, project_id, content) VALUES (?, ?, ?)",
-            (user_id, project_id, content)
+            "INSERT INTO projects (user_id, name) VALUES (?, ?)", (user_id, name)
         )
         return cur.lastrowid
 
 
-def get_notes(user_id: int, project_id: int, limit: int = 15):
+# ── Notes ─────────────────────────────────────────────────────────────────────
+
+def add_note(user_id: int, project_id: int, raw_text: str,
+             refined_text: str, tags: str = "") -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO notes (user_id, project_id, raw_text, refined_text, tags) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, project_id, raw_text, refined_text, tags)
+        )
+        return cur.lastrowid
+
+
+def get_notes(user_id: int, project_id: int, limit: int = 10):
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM notes
@@ -114,17 +100,28 @@ def get_notes(user_id: int, project_id: int, limit: int = 15):
         return [dict(r) for r in rows]
 
 
+def get_note(note_id: int, user_id: int):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM notes WHERE id = ? AND user_id = ?", (note_id, user_id)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+
 def add_task(user_id: int, project_id: int, title: str,
-             description: str = None, reminder_at: str = None) -> int:
+             description: str = None, tags: str = "",
+             source_note_id: int = None) -> int:
     with get_conn() as conn:
         cur = conn.execute("""
-            INSERT INTO tasks (user_id, project_id, title, description, reminder_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, project_id, title, description, reminder_at))
+            INSERT INTO tasks (user_id, project_id, title, description, tags, source_note_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, project_id, title, description, tags, source_note_id))
         return cur.lastrowid
 
 
-def get_tasks(user_id: int, project_id: int, status: str = 'pending'):
+def get_tasks(user_id: int, project_id: int, status: str = "pending"):
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM tasks
@@ -137,7 +134,8 @@ def get_tasks(user_id: int, project_id: int, status: str = 'pending'):
 def complete_task(task_id: int, user_id: int):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'completed' WHERE id = ? AND user_id = ?",
+            "UPDATE tasks SET status = 'completed', completed_at = datetime('now') "
+            "WHERE id = ? AND user_id = ?",
             (task_id, user_id)
         )
 
@@ -151,7 +149,6 @@ def set_task_reminder(task_id: int, user_id: int, reminder_at: str):
 
 
 def get_due_reminders():
-    """Return tasks whose reminder time has passed and haven't been sent yet."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT t.*, p.name AS project_name
