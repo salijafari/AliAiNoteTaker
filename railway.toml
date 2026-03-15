@@ -1,0 +1,15 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "always"
+
+# IMPORTANT: You must add a Volume in the Railway dashboard for data to persist across deploys.
+# Steps:
+#   1. Go to your service in Railway dashboard
+#   2. Click "Volumes" tab → "Add Volume"
+#   3. Set Mount Path to: /data
+#   4. That's it — the bot will automatically use /data/bot_data.db
+#
+# Without the volume, the SQLite database is wiped on every redeploy.
