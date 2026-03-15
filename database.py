@@ -135,6 +135,18 @@ def init_db():
         if not _column_exists(conn, 'tasks', 'chat_id'):
             conn.execute("ALTER TABLE tasks ADD COLUMN chat_id INTEGER")
 
+        # ── Whitelist table ────────────────────────────────────────────────────
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS whitelist (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                type        TEXT    NOT NULL CHECK (type IN ('user', 'chat')),
+                telegram_id INTEGER NOT NULL,
+                added_by    INTEGER,
+                added_at    TEXT    DEFAULT (datetime('now')),
+                UNIQUE(type, telegram_id)
+            );
+        ''')
+
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 
@@ -329,3 +341,45 @@ def set_chat_projects(chat_id: int, project_ids: list):
                 "INSERT OR IGNORE INTO chat_projects (chat_id, project_id) VALUES (?, ?)",
                 (chat_id, pid)
             )
+
+
+# ── Whitelist ──────────────────────────────────────────────────────────────────
+
+def is_whitelisted(entry_type: str, telegram_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM whitelist WHERE type = ? AND telegram_id = ?",
+            (entry_type, telegram_id)
+        ).fetchone()
+        return row is not None
+
+
+def add_to_whitelist(entry_type: str, telegram_id: int, added_by: int) -> bool:
+    """Returns True if added, False if already present."""
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO whitelist (type, telegram_id, added_by) VALUES (?, ?, ?)",
+                (entry_type, telegram_id, added_by)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_from_whitelist(entry_type: str, telegram_id: int) -> bool:
+    """Returns True if removed, False if not found."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM whitelist WHERE type = ? AND telegram_id = ?",
+            (entry_type, telegram_id)
+        )
+        return cur.rowcount > 0
+
+
+def get_whitelist():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM whitelist ORDER BY type, added_at"
+        ).fetchall()
+        return [dict(r) for r in rows]

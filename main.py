@@ -5,11 +5,13 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
     ConversationHandler,
+    TypeHandler,
     filters,
     ContextTypes,
 )
@@ -26,7 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
+_admin_raw   = os.getenv("ADMIN_USER_ID", "")
+ADMIN_USER_ID = int(_admin_raw) if _admin_raw.strip().isdigit() else None
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
@@ -146,6 +150,121 @@ async def _send_project_picker(update_or_query, user_id: int, prompt: str, chat_
         await update_or_query.message.reply_text(prompt, reply_markup=kb, parse_mode="Markdown")
     else:
         await update_or_query.edit_message_text(prompt, reply_markup=kb, parse_mode="Markdown")
+
+
+# ── Access guard (runs before every handler) ─────────────────────────────────
+
+async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Block any user/chat not on the whitelist. Admin always passes."""
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    # Master admin always allowed
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return
+
+    # Whitelisted user or whitelisted chat
+    if user_id and db.is_whitelisted("user", user_id):
+        return
+    if chat_id and chat_id != user_id and db.is_whitelisted("chat", chat_id):
+        return
+
+    # Denied — respond once and stop all further processing
+    if update.message:
+        await update.message.reply_text("⛔ Access denied.")
+    elif update.callback_query:
+        await update.callback_query.answer("⛔ Access denied.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
+# ── Admin helpers ─────────────────────────────────────────────────────────────
+
+def _is_admin(user_id: int) -> bool:
+    return ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
+
+
+# ── Admin commands ────────────────────────────────────────────────────────────
+
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /adduser <user_id>")
+        return
+    uid = int(context.args[0])
+    added = db.add_to_whitelist("user", uid, update.effective_user.id)
+    if added:
+        await update.message.reply_text(f"✅ User `{uid}` added to whitelist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ User `{uid}` is already whitelisted.", parse_mode="Markdown")
+
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /removeuser <user_id>")
+        return
+    uid = int(context.args[0])
+    if uid == ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Cannot remove the master admin.")
+        return
+    removed = db.remove_from_whitelist("user", uid)
+    if removed:
+        await update.message.reply_text(f"🗑 User `{uid}` removed from whitelist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ User `{uid}` was not on the whitelist.", parse_mode="Markdown")
+
+
+async def cmd_addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    chat_id = update.effective_chat.id
+    title   = update.effective_chat.title or str(chat_id)
+    added   = db.add_to_whitelist("chat", chat_id, update.effective_user.id)
+    if added:
+        await update.message.reply_text(f"✅ Chat *{title}* (`{chat_id}`) added to whitelist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ This chat is already whitelisted.", parse_mode="Markdown")
+
+
+async def cmd_removechat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    chat_id = update.effective_chat.id
+    title   = update.effective_chat.title or str(chat_id)
+    removed = db.remove_from_whitelist("chat", chat_id)
+    if removed:
+        await update.message.reply_text(f"🗑 Chat *{title}* removed from whitelist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ This chat was not on the whitelist.", parse_mode="Markdown")
+
+
+async def cmd_listaccess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    entries = db.get_whitelist()
+    if not entries:
+        await update.message.reply_text("📋 Whitelist is empty.")
+        return
+    users = [e for e in entries if e["type"] == "user"]
+    chats = [e for e in entries if e["type"] == "chat"]
+    lines = [f"📋 *Whitelist* ({len(entries)} entries)\n"]
+    if users:
+        lines.append("*Users:*")
+        for e in users:
+            admin_tag = " _(master admin)_" if e["telegram_id"] == ADMIN_USER_ID else ""
+            lines.append(f"  • `{e['telegram_id']}`{admin_tag} — added {e['added_at'][:10]}")
+    if chats:
+        lines.append("\n*Chats:*")
+        for e in chats:
+            lines.append(f"  • `{e['telegram_id']}` — added {e['added_at'][:10]}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -1033,11 +1152,16 @@ async def check_deadline_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start",        "Welcome screen"),
-        BotCommand("note",         "Capture a note under a project"),
-        BotCommand("task",         "Create or convert tasks"),
-        BotCommand("project",      "Browse and manage your projects"),
-        BotCommand("chatprojects", "Configure projects accessible in this group (admins only)"),
+        BotCommand("start",         "Welcome screen"),
+        BotCommand("note",          "Capture a note under a project"),
+        BotCommand("task",          "Create or convert tasks"),
+        BotCommand("project",       "Browse and manage your projects"),
+        BotCommand("chatprojects",  "Configure projects for this group (admins only)"),
+        BotCommand("adduser",       "[Admin] Whitelist a user by ID"),
+        BotCommand("removeuser",    "[Admin] Remove a user from the whitelist"),
+        BotCommand("addchat",       "[Admin] Whitelist this chat"),
+        BotCommand("removechat",    "[Admin] Remove this chat from the whitelist"),
+        BotCommand("listaccess",    "[Admin] Show all whitelisted users and chats"),
     ])
 
 
@@ -1045,6 +1169,13 @@ async def post_init(app: Application) -> None:
 
 def main():
     db.init_db()
+
+    # Seed master admin into whitelist on every startup (safe — uses INSERT OR IGNORE)
+    if ADMIN_USER_ID:
+        db.add_to_whitelist("user", ADMIN_USER_ID, ADMIN_USER_ID)
+        logger.info(f"Admin user {ADMIN_USER_ID} ensured in whitelist")
+    else:
+        logger.warning("ADMIN_USER_ID not set — bot is open to everyone!")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -1111,7 +1242,18 @@ def main():
         allow_reentry=True,
     )
 
+    # Access guard runs before every handler (group -1)
+    app.add_handler(TypeHandler(Update, access_guard), group=-1)
+
     app.add_handler(CommandHandler("start", start))
+
+    # Admin commands
+    app.add_handler(CommandHandler("adduser",    cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("addchat",    cmd_addchat))
+    app.add_handler(CommandHandler("removechat", cmd_removechat))
+    app.add_handler(CommandHandler("listaccess", cmd_listaccess))
+
     app.add_handler(note_conv)
     app.add_handler(task_conv)
     app.add_handler(project_conv)

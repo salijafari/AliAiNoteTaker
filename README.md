@@ -1,34 +1,42 @@
 # 🤖 AI Productivity Telegram Bot
 
 A personal note-taking and task management bot powered by Claude AI.
-Supports multiple projects, reminders, and natural language commands.
+Supports multiple projects, reminders, deadlines, and natural language commands.
+Works in private chats and group chats (whitelisted only).
 
 ---
 
 ## Features
 
-- 📝 Save quick notes per project
-- 🤖 AI converts notes into actionable tasks (powered by Claude)
-- ✅ Mark tasks complete with one tap
-- ⏰ Set reminders (1hr / 3hr / tomorrow / 1 week)
-- 📂 Multiple projects (YVR, Evalyze, Personal, etc.)
-- 💬 Natural language — just talk to the bot normally
+- 📝 Save quick notes per project, refined by Claude AI
+- 🤖 AI converts notes into actionable tasks
+- ✅ Mark tasks complete, edit content, set deadlines
+- ⏰ Deadline reminders (1 day before) and custom reminders
+- 📂 Multiple projects per user
+- 👥 Group chat support (admin controls which groups can access)
+- 🔒 Whitelist-based access control — only allowed users/chats can use the bot
 
 ---
 
 ## Commands
 
+### Regular commands
 | Command | What it does |
 |---------|-------------|
-| `/start` | Welcome screen + help |
-| `/note your text` | Save a note to active project |
-| `/notes` | View recent notes |
-| `/tasks` | View pending tasks (with Done + Remind buttons) |
-| `/projects` | List projects + switch between them |
-| `/newproject Name` | Create a new project |
-| `/convert` | Let Claude turn your notes into tasks |
+| `/start` | Welcome screen |
+| `/note` | Capture a note under a project |
+| `/task` | Create tasks, generate from notes, or view existing |
+| `/project` | Browse and manage your projects |
+| `/chatprojects` | (Group admins) Choose which projects are accessible in this group |
 
-Or just chat naturally — Claude understands plain English!
+### Admin-only commands
+| Command | What it does |
+|---------|-------------|
+| `/adduser <user_id>` | Whitelist a user by their Telegram numeric ID |
+| `/removeuser <user_id>` | Remove a user from the whitelist |
+| `/addchat` | Whitelist the current group/channel (run inside the group) |
+| `/removechat` | Remove the current group/channel from the whitelist |
+| `/listaccess` | Show all whitelisted users and chats |
 
 ---
 
@@ -38,9 +46,8 @@ Or just chat naturally — Claude understands plain English!
 
 1. Open Telegram and search for **@BotFather**
 2. Send: `/newbot`
-3. Choose a name (e.g. "Ali's Productivity Bot")
-4. Choose a username ending in `bot` (e.g. `ali_productivity_bot`)
-5. BotFather gives you a **token** — copy it, keep it safe!
+3. Choose a name and a username ending in `bot`
+4. BotFather gives you a **token** — copy it, keep it safe!
 
 ---
 
@@ -53,56 +60,77 @@ Or just chat naturally — Claude understands plain English!
 
 ---
 
-### Step 3 — Put your code on GitHub
+### Step 3 — Find your Telegram user ID (for ADMIN_USER_ID)
 
-1. Go to https://github.com and create a free account if you don't have one
-2. Click the **+** button → **New repository**
-3. Name it `productivity-bot`, set it to **Private**, click Create
-4. On your computer, create a folder called `productivity-bot`
-5. Copy all the bot files into it:
-   - `main.py`
-   - `database.py`
-   - `claude_ai.py`
-   - `requirements.txt`
-   - `Procfile`
-   - `.env.example`
-6. Do NOT add the `.env` file — that stays private!
-7. Upload to GitHub:
-   - On the repository page, click **uploading an existing file**
-   - Drag and drop the files
-   - Click **Commit changes**
+1. Open Telegram and search for **@userinfobot**
+2. Send any message to it
+3. It replies instantly with your numeric user ID (e.g. `123456789`)
+4. Save this number — you'll need it in Step 4
+
+This ID becomes the **master admin** of your bot. Only this account can run admin commands.
 
 ---
 
-### Step 4 — Deploy on Railway
+### Step 4 — Put your code on GitHub
+
+1. Go to https://github.com and create a free account if needed
+2. Create a new **private** repository named `productivity-bot`
+3. Upload all bot files:
+   - `main.py`, `database.py`, `claude_ai.py`
+   - `requirements.txt`, `Procfile`, `railway.toml`
+   - `.env.example` (safe to commit — no real secrets in it)
+4. Do **NOT** upload your `.env` file — that stays private!
+
+---
+
+### Step 5 — Deploy on Railway
 
 1. Go to https://railway.app and sign in with GitHub
-2. Click **New Project** → **Deploy from GitHub repo**
-3. Select your `productivity-bot` repository
-4. Railway will detect it automatically
+2. Click **New Project** → **Deploy from GitHub repo** → select your repo
 
-**Add your secret keys:**
-5. In Railway, go to your project → **Variables** tab
-6. Add these two variables:
-   - `TELEGRAM_BOT_TOKEN` = (paste your BotFather token)
-   - `ANTHROPIC_API_KEY` = (paste your Anthropic key)
+**Add environment variables:**
 
-**Set the start command:**
-7. Go to **Settings** → **Deploy** section
-8. Set the **Start Command** to: `python main.py`
+3. In Railway, go to your project → **Variables** tab
+4. Add these variables:
+   - `TELEGRAM_BOT_TOKEN` = (your BotFather token)
+   - `ANTHROPIC_API_KEY` = (your Anthropic key)
+   - `ADMIN_USER_ID` = (your numeric Telegram user ID from Step 3)
 
-9. Click **Deploy** — Railway will install packages and start your bot!
+**Add a persistent volume (IMPORTANT — prevents data loss on redeploy):**
+
+5. Go to your service → **Volumes** tab → **Add Volume**
+6. Set **Mount Path** to `/data`
+7. Click **Add**
+
+8. Click **Deploy** — Railway installs packages and starts your bot!
 
 ---
 
-### Step 5 — Test it!
+### Step 6 — First run
 
 1. Open Telegram and search for your bot by username
-2. Send `/start`
-3. Type your first project name (e.g. "YVR")
-4. Try: `/note follow up with vendor about voucher system`
-5. Try: `/convert` — Claude will turn your notes into tasks
-6. Try: `/tasks` — tap the Remind button on any task
+2. Send `/start` — the bot responds (you're the admin, always allowed)
+3. To give another person access: `/adduser 987654321` (their user ID)
+4. To allow a group: add the bot to the group, then run `/addchat` inside it
+
+---
+
+## Adding the bot to a group
+
+1. Open the group in Telegram
+2. Tap the group name → **Add Members** → search for your bot
+3. Inside the group, run `/addchat` (you must be the admin)
+4. Then run `/chatprojects` to choose which of your projects are accessible in that group
+5. Members of the group can now use `/note`, `/task`, `/project` inside the group
+
+---
+
+## Access control
+
+- The bot silently ignores (or sends "Access denied" to) any user or chat not on the whitelist
+- `ADMIN_USER_ID` is the master admin — permanently whitelisted, can never be removed
+- You can whitelist individual users (`/adduser`) or entire chats (`/addchat`)
+- `/listaccess` shows everything currently whitelisted
 
 ---
 
@@ -111,18 +139,19 @@ Or just chat naturally — Claude understands plain English!
 ```
 productivity-bot/
 ├── main.py          ← Bot logic + all commands
-├── database.py      ← Saves notes/tasks to SQLite
-├── claude_ai.py     ← Talks to Claude API
-├── requirements.txt ← Python packages needed
-├── Procfile         ← Tells Railway how to start
-└── .env.example     ← Template for your secret keys
+├── database.py      ← SQLite: notes, tasks, projects, whitelist
+├── claude_ai.py     ← Claude AI integration
+├── requirements.txt ← Python packages
+├── Procfile         ← Railway start command
+├── railway.toml     ← Railway deploy config
+└── .env.example     ← Template for environment variables
 ```
 
 ---
 
 ## Notes
 
-- Your data is stored in a SQLite file (`bot_data.db`) on Railway's server
-- Railway's free tier may sleep after inactivity — upgrade to the $5/mo Hobby plan for always-on
-- The bot checks for due reminders every 60 seconds
-- You can have as many projects as you need
+- Data is stored in SQLite at `/data/bot_data.db` (Railway persistent volume)
+- Without the Railway volume, data resets on every redeploy — set it up in Step 5
+- Deadline reminders fire once per hour; custom reminders check every 60 seconds
+- You can have unlimited projects, notes, and tasks
