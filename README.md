@@ -27,7 +27,22 @@ Works in private chats and group chats (whitelisted only).
 | `/note` | Capture a note under a project |
 | `/task` | Create tasks, generate from notes, or view existing |
 | `/project` | Browse and manage your projects |
+| `/ideas` | View recent ideas for the active project |
+| `/journal` | View recent journal entries for the active project |
+| `/references` | View saved links for the active project |
+| `/search <query>` | Search across notes, tasks, ideas, journal, and references |
+| `/digest` | Get today's activity digest (also sent automatically at 8 PM UTC) |
 | `/chatprojects` | (Group admins) Choose which projects are accessible in this group |
+
+### Send anything — the bot classifies it automatically
+Just send a plain text message, a voice note, a photo, or a URL — the bot will:
+- **Voice/audio** → transcribed with OpenAI Whisper, then classified
+- **Photo/image** → text extracted with Claude Vision, then classified
+- **URL** → page title and description fetched and saved as a reference
+- **Plain text** → classified by Claude as a note, task, idea, or journal entry
+
+After every save, tap the inline buttons to reclassify or move to a different category.
+If the item has a deadline, a **Add to Google Calendar** button appears automatically.
 
 ### Admin-only commands
 | Command | What it does |
@@ -95,6 +110,7 @@ This ID becomes the **master admin** of your bot. Only this account can run admi
    - `TELEGRAM_BOT_TOKEN` = (your BotFather token)
    - `ANTHROPIC_API_KEY` = (your Anthropic key)
    - `ADMIN_USER_ID` = (your numeric Telegram user ID from Step 3)
+   - `OPENAI_API_KEY` = (your OpenAI key — required for voice transcription, optional otherwise)
 
 **Add a persistent volume (IMPORTANT — prevents data loss on redeploy):**
 
