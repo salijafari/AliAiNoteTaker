@@ -147,6 +147,35 @@ def init_db():
             );
         ''')
 
+        # ── Content classification tables ──────────────────────────────────────
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS saved_references (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                project_id  INTEGER NOT NULL,
+                url         TEXT    NOT NULL,
+                title       TEXT    DEFAULT '',
+                description TEXT    DEFAULT '',
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS ideas (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                project_id  INTEGER NOT NULL,
+                content     TEXT    NOT NULL,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS journal (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                project_id  INTEGER NOT NULL,
+                content     TEXT    NOT NULL,
+                created_at  TEXT    DEFAULT (datetime('now'))
+            );
+        ''')
+
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 
@@ -383,3 +412,212 @@ def get_whitelist():
             "SELECT * FROM whitelist ORDER BY type, added_at"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── References ─────────────────────────────────────────────────────────────────
+
+def add_reference(user_id: int, project_id: int, url: str,
+                  title: str = "", description: str = "") -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO saved_references (user_id, project_id, url, title, description) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, project_id, url, title, description)
+        )
+        return cur.lastrowid
+
+
+def get_references(user_id: int, project_id: int, limit: int = 10):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM saved_references WHERE user_id=? AND project_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_reference(ref_id: int, user_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM saved_references WHERE id=? AND user_id=?", (ref_id, user_id))
+
+
+# ── Ideas ──────────────────────────────────────────────────────────────────────
+
+def add_idea(user_id: int, project_id: int, content: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO ideas (user_id, project_id, content) VALUES (?, ?, ?)",
+            (user_id, project_id, content)
+        )
+        return cur.lastrowid
+
+
+def get_ideas(user_id: int, project_id: int, limit: int = 10):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ideas WHERE user_id=? AND project_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_idea(idea_id: int, user_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM ideas WHERE id=? AND user_id=?", (idea_id, user_id))
+
+
+# ── Journal ────────────────────────────────────────────────────────────────────
+
+def add_journal_entry(user_id: int, project_id: int, content: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO journal (user_id, project_id, content) VALUES (?, ?, ?)",
+            (user_id, project_id, content)
+        )
+        return cur.lastrowid
+
+
+def get_journal_entries(user_id: int, project_id: int, limit: int = 10):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM journal WHERE user_id=? AND project_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_journal_entry(journal_id: int, user_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM journal WHERE id=? AND user_id=?", (journal_id, user_id))
+
+
+# ── Reclassify helpers ─────────────────────────────────────────────────────────
+
+def delete_note(note_id: int, user_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM notes WHERE id=? AND user_id=?", (note_id, user_id))
+
+
+def delete_task_record(task_id: int, user_id: int):
+    """Hard-delete a task (distinct from complete_task which marks it done)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM tasks WHERE id=? AND user_id=?", (task_id, user_id))
+
+
+# ── Search ─────────────────────────────────────────────────────────────────────
+
+def search_all(user_id: int, project_id: int, query: str, limit_per_type: int = 5) -> dict:
+    """Search across all content tables for the given project."""
+    pat = f"%{query}%"
+    with get_conn() as conn:
+        notes = conn.execute(
+            "SELECT id, 'note' AS type, refined_text AS content, created_at FROM notes "
+            "WHERE user_id=? AND project_id=? AND (refined_text LIKE ? OR tags LIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, pat, pat, limit_per_type)
+        ).fetchall()
+
+        tasks = conn.execute(
+            "SELECT id, 'task' AS type, title AS content, created_at FROM tasks "
+            "WHERE user_id=? AND project_id=? AND status='pending' "
+            "AND (title LIKE ? OR description LIKE ? OR tags LIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, pat, pat, pat, limit_per_type)
+        ).fetchall()
+
+        ideas = conn.execute(
+            "SELECT id, 'idea' AS type, content, created_at FROM ideas "
+            "WHERE user_id=? AND project_id=? AND content LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, pat, limit_per_type)
+        ).fetchall()
+
+        journal_rows = conn.execute(
+            "SELECT id, 'journal' AS type, content, created_at FROM journal "
+            "WHERE user_id=? AND project_id=? AND content LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, pat, limit_per_type)
+        ).fetchall()
+
+        refs = conn.execute(
+            "SELECT id, 'reference' AS type, COALESCE(NULLIF(title,''), url) AS content, created_at "
+            "FROM saved_references "
+            "WHERE user_id=? AND project_id=? AND (title LIKE ? OR description LIKE ? OR url LIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, project_id, pat, pat, pat, limit_per_type)
+        ).fetchall()
+
+    return {
+        "notes":      [dict(r) for r in notes],
+        "tasks":      [dict(r) for r in tasks],
+        "ideas":      [dict(r) for r in ideas],
+        "journal":    [dict(r) for r in journal_rows],
+        "references": [dict(r) for r in refs],
+    }
+
+
+# ── Daily digest ───────────────────────────────────────────────────────────────
+
+def get_active_users_today() -> list:
+    """Return user_ids who had any activity today and have a private chat registered."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT user_id FROM (
+                SELECT user_id FROM notes            WHERE date(created_at) = ?
+                UNION
+                SELECT user_id FROM tasks            WHERE date(created_at) = ?
+                UNION
+                SELECT user_id FROM ideas            WHERE date(created_at) = ?
+                UNION
+                SELECT user_id FROM journal          WHERE date(created_at) = ?
+                UNION
+                SELECT user_id FROM saved_references WHERE date(created_at) = ?
+            )
+            WHERE user_id IN (SELECT id FROM chats WHERE chat_type = 'private')
+        """, (today, today, today, today, today)).fetchall()
+        return [r[0] for r in rows]
+
+
+def get_daily_activity(user_id: int) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        def _count(table, extra_where=""):
+            return conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE user_id=? AND date(created_at)=? {extra_where}",
+                (user_id, today)
+            ).fetchone()[0]
+
+        tasks_completed = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE user_id=? AND date(completed_at)=?",
+            (user_id, today)
+        ).fetchone()[0]
+
+        upcoming = conn.execute(
+            "SELECT title, deadline FROM tasks WHERE user_id=? AND status='pending' "
+            "AND deadline IS NOT NULL ORDER BY deadline ASC LIMIT 5",
+            (user_id,)
+        ).fetchall()
+
+        project_names = conn.execute(
+            "SELECT DISTINCT p.name FROM projects p "
+            "JOIN notes n ON n.project_id = p.id WHERE n.user_id=? AND date(n.created_at)=? "
+            "UNION "
+            "SELECT DISTINCT p.name FROM projects p "
+            "JOIN tasks t ON t.project_id = p.id WHERE t.user_id=? AND date(t.created_at)=?",
+            (user_id, today, user_id, today)
+        ).fetchall()
+
+        return {
+            "notes":           _count("notes"),
+            "tasks_created":   _count("tasks"),
+            "tasks_completed": tasks_completed,
+            "ideas":           _count("ideas"),
+            "journal":         _count("journal"),
+            "references":      _count("saved_references"),
+            "upcoming_tasks":  [dict(r) for r in upcoming],
+            "project_names":   [r[0] for r in project_names],
+        }

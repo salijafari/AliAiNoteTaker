@@ -1,7 +1,12 @@
+import asyncio
+import io
 import os
+import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime, timezone
+from urllib.parse import quote
 
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
@@ -28,9 +33,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
-_admin_raw   = os.getenv("ADMIN_USER_ID", "")
+BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
+_admin_raw    = os.getenv("ADMIN_USER_ID", "")
 ADMIN_USER_ID = int(_admin_raw) if _admin_raw.strip().isdigit() else None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# Regex to detect URLs in messages
+URL_RE = re.compile(r'https?://\S+')
+
+# Per-user processing set for message queue (Feature 9)
+_user_processing: set = set()
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
@@ -59,6 +71,7 @@ _SUGGESTED_IDS  = "selected_suggested_ids"
 _EDIT_TASK_ID   = "edit_task_id"
 _CHAT_OWNER_ID  = "chat_owner_id"
 _CHAT_ID_KEY    = "chat_id_flow"
+_LAST_SAVED     = "last_saved"   # {type, id, content, project_id}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -150,6 +163,157 @@ async def _send_project_picker(update_or_query, user_id: int, prompt: str, chat_
         await update_or_query.message.reply_text(prompt, reply_markup=kb, parse_mode="Markdown")
     else:
         await update_or_query.edit_message_text(prompt, reply_markup=kb, parse_mode="Markdown")
+
+
+# ── New helpers ───────────────────────────────────────────────────────────────
+
+def _reclassify_kb() -> InlineKeyboardMarkup:
+    """Inline keyboard shown after any save so user can move item to another type."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 → Note",    callback_data="rc_note"),
+            InlineKeyboardButton("✅ → Task",    callback_data="rc_task"),
+        ],
+        [
+            InlineKeyboardButton("💡 → Idea",   callback_data="rc_idea"),
+            InlineKeyboardButton("📖 → Journal", callback_data="rc_journal"),
+        ],
+    ])
+
+
+def _make_calendar_url(title: str, date_str: str) -> str:
+    """Build a Google Calendar quick-add URL for an all-day event."""
+    d = date_str.replace("-", "")
+    return (
+        f"https://calendar.google.com/calendar/render"
+        f"?action=TEMPLATE&text={quote(title)}&dates={d}%2F{d}"
+    )
+
+
+def _fetch_url_meta(url: str) -> tuple:
+    """Fetch (title, description) from a URL. Returns ('', '') on any error."""
+    try:
+        r = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+        html = r.text
+        title_m = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
+        title   = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()[:200] if title_m else ""
+        title   = re.sub(r'\s+', ' ', title)
+        desc_m  = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)["\']', html, re.I
+        ) or re.search(
+            r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+name=["\']description["\']', html, re.I
+        )
+        desc = desc_m.group(1).strip()[:300] if desc_m else ""
+        return title, desc
+    except Exception:
+        return "", ""
+
+
+async def _get_or_pick_project(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Return active project dict, or None if user needs to select one first."""
+    project_id = context.user_data.get(_PROJECT_ID)
+    if project_id:
+        project = db.get_project(project_id, user_id)
+        if project:
+            return project
+
+    projects = db.get_projects(user_id)
+    if not projects:
+        await update.message.reply_text(
+            "You don't have any projects yet. Use /project to create one first."
+        )
+        return None
+
+    if len(projects) == 1:
+        context.user_data[_PROJECT_ID] = projects[0]["id"]
+        return projects[0]
+
+    # Multiple projects — use the most recently created one and tell the user
+    latest = sorted(projects, key=lambda p: p.get("created_at", ""), reverse=True)[0]
+    context.user_data[_PROJECT_ID] = latest["id"]
+    return latest
+
+
+async def _classify_and_save(
+    message,          # update.message
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    user_id: int,
+    project: dict,
+):
+    """Classify text with Claude, save to the right table, show result + reclassify buttons."""
+    try:
+        result = ai.classify_content(text, project["name"])
+    except Exception as e:
+        logger.error(f"classify_content error: {e}")
+        result = {"action": "save_note", "content": text, "title": None,
+                  "tags": "", "deadline": None, "calendar_event": None}
+
+    action    = result.get("action", "save_note")
+    content   = result.get("content", text)
+    tags      = result.get("tags", "") or ai.extract_hashtags(text)
+    deadline  = result.get("deadline")
+    cal_event = result.get("calendar_event")
+    project_id = project["id"]
+
+    # ── Save to correct table ──
+    if action == "save_task":
+        title   = result.get("title") or content[:60]
+        item_id = db.add_task(user_id, project_id, title,
+                              content if content != title else None, tags, deadline=deadline)
+        label   = f"✅ *Task saved to {project['name']}*\n\n*{title}*"
+        if deadline:
+            label += f"\n📅 Due: {deadline}"
+        saved_type = "task"
+        saved_content = title
+
+    elif action == "save_idea":
+        item_id    = db.add_idea(user_id, project_id, content)
+        label      = f"💡 *Idea saved to {project['name']}*\n\n{content}"
+        saved_type = "idea"
+        saved_content = content
+
+    elif action == "save_journal":
+        item_id    = db.add_journal_entry(user_id, project_id, content)
+        label      = f"📖 *Journal entry saved to {project['name']}*\n\n{content}"
+        saved_type = "journal"
+        saved_content = content
+
+    else:  # save_note (default)
+        try:
+            refined = ai.refine_note(content, project["name"])
+        except Exception:
+            refined = content
+        item_id    = db.add_note(user_id, project_id, content, refined, tags)
+        label      = f"📝 *Note saved to {project['name']}*\n\n{refined}"
+        saved_type = "note"
+        saved_content = refined
+
+    # Store for reclassify
+    context.user_data[_LAST_SAVED] = {
+        "type": saved_type, "id": item_id,
+        "content": saved_content, "project_id": project_id,
+    }
+
+    # Build keyboard: reclassify + optional calendar
+    rows = list(_reclassify_kb().inline_keyboard)
+    if deadline and cal_event:
+        cal_title = cal_event.get("title", saved_content[:60])
+        rows.append([InlineKeyboardButton(
+            "📅 Add to Google Calendar",
+            url=_make_calendar_url(cal_title, deadline)
+        )])
+    elif deadline and action == "save_task":
+        rows.append([InlineKeyboardButton(
+            "📅 Add to Google Calendar",
+            url=_make_calendar_url(result.get("title", content[:60]), deadline)
+        )])
+
+    await message.reply_text(
+        label + (f"\n🏷 {tags}" if tags else ""),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 # ── Access guard (runs before every handler) ─────────────────────────────────
@@ -341,14 +505,20 @@ async def note_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"refine_note error: {e}")
         refined = raw_text
 
-    tags = ai.extract_hashtags(raw_text)
-    db.add_note(user_id, project_id, raw_text, refined, tags)
+    tags    = ai.extract_hashtags(raw_text)
+    note_id = db.add_note(user_id, project_id, raw_text, refined, tags)
+
+    context.user_data[_LAST_SAVED] = {
+        "type": "note", "id": note_id,
+        "content": refined, "project_id": project_id,
+    }
 
     tag_line = f"\n🏷 Tags: {tags}" if tags else ""
     await update.message.reply_text(
         f"✅ *Note saved to {project['name']}*\n\n"
         f"{refined}{tag_line}",
         parse_mode="Markdown",
+        reply_markup=_reclassify_kb(),
     )
     return ConversationHandler.END
 
@@ -570,17 +740,36 @@ async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = [{"title": raw_text[:60], "description": None, "tags": ""}]
 
     saved_lines = []
+    last_task_id = None
+    last_title   = None
+    last_deadline = None
     for result in results:
-        tags     = result.get("tags") or ai.extract_hashtags(raw_text)
-        deadline = result.get("deadline")
-        db.add_task(user_id, project_id, result["title"], result.get("description"), tags,
-                    deadline=deadline)
+        tags      = result.get("tags") or ai.extract_hashtags(raw_text)
+        deadline  = result.get("deadline")
+        task_id   = db.add_task(user_id, project_id, result["title"], result.get("description"),
+                                tags, deadline=deadline)
+        last_task_id  = task_id
+        last_title    = result["title"]
+        last_deadline = deadline
         tag_line      = f" 🏷 {tags}" if tags else ""
         deadline_line = f" 📅 {deadline}" if deadline else ""
         saved_lines.append(f"• *{result['title']}*{deadline_line}{tag_line}")
 
+    context.user_data[_LAST_SAVED] = {
+        "type": "task", "id": last_task_id,
+        "content": last_title or "", "project_id": project_id,
+    }
+
+    rows = list(_reclassify_kb().inline_keyboard)
+    if last_deadline and last_title:
+        rows.append([InlineKeyboardButton(
+            "📅 Add to Google Calendar",
+            url=_make_calendar_url(last_title, last_deadline)
+        )])
+
     reply = f"✅ *{len(results)} task(s) saved to {project['name']}*\n\n" + "\n".join(saved_lines)
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await update.message.reply_text(reply, parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup(rows))
     return ConversationHandler.END
 
 
@@ -1057,6 +1246,361 @@ async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"on_bot_added send error: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Voice / Photo / NL message handlers  (Features 1, 2, 3, 4, 9)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Feature 1 — transcribe voice/audio and classify the result."""
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "⚠️ Voice transcription is not configured. "
+            "Set OPENAI_API_KEY in your environment to enable it."
+        )
+        return
+
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return
+    user_id, _ = result
+
+    project = await _get_or_pick_project(update, context, user_id)
+    if not project:
+        return
+
+    msg = await update.message.reply_text("🎙 Transcribing your voice message…")
+
+    try:
+        voice   = update.message.voice or update.message.audio
+        vfile   = await voice.get_file()
+        buf     = io.BytesIO()
+        await vfile.download_to_memory(buf)
+        audio_bytes = buf.getvalue()
+        filename    = "voice.ogg" if update.message.voice else "audio.mp3"
+        text = ai.transcribe_audio(audio_bytes, filename)
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {e}")
+        await msg.edit_text("❌ Transcription failed. Please type your message instead.")
+        return
+
+    await msg.edit_text(f"🎙 *Heard:* _{text}_\n\n_Classifying…_", parse_mode="Markdown")
+    await _run_with_queue(update, context, user_id, text, project)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Feature 2 — extract text from photo/image via Claude vision and classify it."""
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return
+    user_id, _ = result
+
+    project = await _get_or_pick_project(update, context, user_id)
+    if not project:
+        return
+
+    msg = await update.message.reply_text("🔍 Extracting text from image…")
+
+    try:
+        if update.message.photo:
+            photo   = update.message.photo[-1]  # highest resolution
+            mime    = "image/jpeg"
+        else:
+            photo   = update.message.document
+            mime    = photo.mime_type or "image/jpeg"
+
+        pfile       = await photo.get_file()
+        buf         = io.BytesIO()
+        await pfile.download_to_memory(buf)
+        image_bytes = buf.getvalue()
+        text = ai.extract_text_from_image(image_bytes, mime)
+    except Exception as e:
+        logger.error(f"Image OCR error: {e}")
+        await msg.edit_text("❌ Could not extract text from the image. Please type your note instead.")
+        return
+
+    if not text.strip():
+        await msg.edit_text("🤷 No readable text found in the image.")
+        return
+
+    await msg.edit_text(
+        f"🖼 *Extracted text:*\n_{text[:300]}{'…' if len(text) > 300 else ''}_\n\n_Saving…_",
+        parse_mode="Markdown",
+    )
+    await _run_with_queue(update, context, user_id, text, project)
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Feature 3 + 4 — detect URLs or classify plain text messages."""
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return
+    user_id, _ = result
+
+    project = await _get_or_pick_project(update, context, user_id)
+    if not project:
+        return
+
+    text = update.message.text.strip()
+
+    # Feature 3 — URL detection
+    url_match = URL_RE.search(text)
+    if url_match:
+        url = url_match.group(0)
+        await _handle_url(update, context, user_id, project, url, text)
+        return
+
+    # Feature 9 — queue if already processing
+    if user_id in _user_processing:
+        _user_queues = context.application.bot_data.setdefault("_queues", {})
+        _user_queues.setdefault(user_id, []).append((text, project))
+        await update.message.reply_text("⏳ Processing your previous message first…")
+        return
+
+    await _run_with_queue(update, context, user_id, text, project)
+
+
+async def _handle_url(update, context, user_id, project, url, raw_text):
+    """Save a URL as a reference."""
+    msg = await update.message.reply_text("🔗 Fetching page info…")
+    title, desc = _fetch_url_meta(url)
+    ref_id = db.add_reference(user_id, project["id"], url, title, desc)
+
+    context.user_data[_LAST_SAVED] = {
+        "type": "reference", "id": ref_id,
+        "content": url, "project_id": project["id"],
+    }
+
+    display_title = title or url[:60]
+    reply = (
+        f"🔗 *Reference saved to {project['name']}*\n\n"
+        f"*{display_title}*\n{url}"
+    )
+    if desc:
+        reply += f"\n_{desc[:150]}_"
+    await msg.edit_text(reply, parse_mode="Markdown", reply_markup=_reclassify_kb())
+
+
+async def _run_with_queue(update, context, user_id, text, project):
+    """Process one NL message; drain any queued messages for this user afterwards."""
+    _user_processing.add(user_id)
+    try:
+        await _classify_and_save(update.message, context, text, user_id, project)
+        # Drain queued messages (Feature 9)
+        queues = context.application.bot_data.get("_queues", {})
+        while queues.get(user_id):
+            queued_text, queued_project = queues[user_id].pop(0)
+            await _classify_and_save(update.message, context, queued_text, user_id, queued_project)
+    finally:
+        _user_processing.discard(user_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# New content-type commands  (Features 3, 4, 6, 8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_references(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    project_id = context.user_data.get(_PROJECT_ID)
+    if not project_id:
+        await update.message.reply_text("Use /project to select a project first.")
+        return
+    project = db.get_project(project_id, user_id)
+    refs    = db.get_references(user_id, project_id)
+    if not refs:
+        await update.message.reply_text(f"📭 No references saved in *{project['name']}* yet.", parse_mode="Markdown")
+        return
+    lines = [f"🔗 *References — {project['name']}:*\n"]
+    for r in refs:
+        t = r.get("title") or r["url"][:50]
+        lines.append(f"• [{t}]({r['url']}) _{r['created_at'][:10]}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def cmd_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    project_id = context.user_data.get(_PROJECT_ID)
+    if not project_id:
+        await update.message.reply_text("Use /project to select a project first.")
+        return
+    project = db.get_project(project_id, user_id)
+    ideas   = db.get_ideas(user_id, project_id)
+    if not ideas:
+        await update.message.reply_text(f"💡 No ideas in *{project['name']}* yet.", parse_mode="Markdown")
+        return
+    lines = [f"💡 *Ideas — {project['name']}:*\n"]
+    for idea in ideas:
+        lines.append(f"• {idea['content']}\n  _{idea['created_at'][:10]}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    project_id = context.user_data.get(_PROJECT_ID)
+    if not project_id:
+        await update.message.reply_text("Use /project to select a project first.")
+        return
+    project = db.get_project(project_id, user_id)
+    entries = db.get_journal_entries(user_id, project_id)
+    if not entries:
+        await update.message.reply_text(f"📖 No journal entries in *{project['name']}* yet.", parse_mode="Markdown")
+        return
+    lines = [f"📖 *Journal — {project['name']}:*\n"]
+    for e in entries:
+        lines.append(f"• {e['content']}\n  _{e['created_at'][:10]}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Feature 6 — /search <query>"""
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    project_id = context.user_data.get(_PROJECT_ID)
+    if not project_id:
+        await update.message.reply_text("Use /project to select a project first, then /search <query>.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /search <query>")
+        return
+
+    query   = " ".join(context.args)
+    project = db.get_project(project_id, user_id)
+    results = db.search_all(user_id, project_id, query)
+
+    total = sum(len(v) for v in results.values())
+    if total == 0:
+        await update.message.reply_text(
+            f"🔍 No results for *{query}* in {project['name']}.\n"
+            "_Try a shorter keyword or check spelling._",
+            parse_mode="Markdown",
+        )
+        return
+
+    icons = {"notes": "📝", "tasks": "✅", "ideas": "💡", "journal": "📖", "references": "🔗"}
+    lines = [f"🔍 *Search: \"{query}\"* — {project['name']}\n"]
+    for key, items in results.items():
+        if not items:
+            continue
+        lines.append(f"\n{icons.get(key, '•')} *{key.capitalize()}*")
+        for item in items:
+            lines.append(f"  • {item['content'][:80]} _{item['created_at'][:10]}_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Feature 8 — /digest: trigger the nightly digest manually."""
+    user_id = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    await _send_digest_to_user(context.bot, user_id)
+
+
+async def _send_digest_to_user(bot, user_id: int):
+    activity = db.get_daily_activity(user_id)
+    total = (activity["notes"] + activity["tasks_created"] + activity["tasks_completed"]
+             + activity["ideas"] + activity["journal"] + activity["references"])
+    if total == 0:
+        try:
+            await bot.send_message(chat_id=user_id, text="📊 No activity recorded today yet.")
+        except Exception:
+            pass
+        return
+
+    try:
+        digest = ai.generate_daily_digest(activity)
+    except Exception as e:
+        logger.error(f"Digest generation error: {e}")
+        digest = (
+            f"Today you captured {activity['notes']} note(s), "
+            f"created {activity['tasks_created']} task(s), "
+            f"completed {activity['tasks_completed']}, "
+            f"saved {activity['ideas']} idea(s), "
+            f"wrote {activity['journal']} journal entry/ies, "
+            f"and bookmarked {activity['references']} reference(s)."
+        )
+
+    lines = [f"📊 *Daily Digest*\n\n{digest}"]
+    if activity["upcoming_tasks"]:
+        lines.append("\n\n📌 *Upcoming tasks:*")
+        for t in activity["upcoming_tasks"]:
+            lines.append(f"  • {t['title']} — due {t['deadline']}")
+
+    try:
+        await bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Digest send error for user {user_id}: {e}")
+
+
+async def nightly_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Feature 8 — runs daily at 8 PM UTC."""
+    for user_id in db.get_active_users_today():
+        await _send_digest_to_user(context.bot, user_id)
+
+
+# ── Reclassify handler (Feature 5) ────────────────────────────────────────────
+
+async def handle_reclassify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    target = query.data.split("_")[1]   # note / task / idea / journal
+    last   = context.user_data.get(_LAST_SAVED)
+
+    if not last:
+        await query.answer("Nothing to reclassify.", show_alert=True)
+        return
+    if target == last["type"]:
+        await query.answer(f"Already saved as {target}.", show_alert=True)
+        return
+
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
+    project_id = last["project_id"]
+    content    = last["content"]
+    source_id  = last["id"]
+    source_type = last["type"]
+
+    # Delete from source table
+    try:
+        if source_type == "note":
+            db.delete_note(source_id, user_id)
+        elif source_type == "task":
+            db.delete_task_record(source_id, user_id)
+        elif source_type == "idea":
+            db.delete_idea(source_id, user_id)
+        elif source_type == "journal":
+            db.delete_journal_entry(source_id, user_id)
+        elif source_type == "reference":
+            db.delete_reference(source_id, user_id)
+    except Exception as e:
+        logger.error(f"Reclassify delete error: {e}")
+
+    # Save to target table
+    project = db.get_project(project_id, user_id)
+    pname   = project["name"] if project else "your project"
+
+    if target == "note":
+        try:
+            refined = ai.refine_note(content, pname)
+        except Exception:
+            refined = content
+        new_id = db.add_note(user_id, project_id, content, refined)
+        label  = f"📝 Moved to Notes"
+    elif target == "task":
+        new_id = db.add_task(user_id, project_id, content[:60], None)
+        label  = f"✅ Moved to Tasks"
+    elif target == "idea":
+        new_id = db.add_idea(user_id, project_id, content)
+        label  = f"💡 Moved to Ideas"
+    elif target == "journal":
+        new_id = db.add_journal_entry(user_id, project_id, content)
+        label  = f"📖 Moved to Journal"
+    else:
+        await query.answer("Unknown target.", show_alert=True)
+        return
+
+    context.user_data[_LAST_SAVED] = {
+        "type": target, "id": new_id, "content": content, "project_id": project_id
+    }
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=_reclassify_kb())
+    await query.message.reply_text(f"✅ {label}.", parse_mode="Markdown")
+
+
 # ── Task/reminder callbacks (outside conversation) ────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1107,6 +1651,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rawnote_"):
         await show_raw_note(update, context)
 
+    elif data.startswith("rc_"):
+        await handle_reclassify(update, context)
+
 
 # ── Reminders job ─────────────────────────────────────────────────────────────
 
@@ -1156,6 +1703,11 @@ async def post_init(app: Application) -> None:
         BotCommand("note",          "Capture a note under a project"),
         BotCommand("task",          "Create or convert tasks"),
         BotCommand("project",       "Browse and manage your projects"),
+        BotCommand("ideas",         "View recent ideas for active project"),
+        BotCommand("journal",       "View recent journal entries"),
+        BotCommand("references",    "View saved links for active project"),
+        BotCommand("search",        "Search across all content (/search <query>)"),
+        BotCommand("digest",        "Get today's activity digest"),
         BotCommand("chatprojects",  "Configure projects for this group (admins only)"),
         BotCommand("adduser",       "[Admin] Whitelist a user by ID"),
         BotCommand("removeuser",    "[Admin] Remove a user from the whitelist"),
@@ -1267,6 +1819,27 @@ def main():
 
     app.job_queue.run_repeating(check_reminders, interval=60, first=15)
     app.job_queue.run_repeating(check_deadline_reminders, interval=3600, first=30)
+    app.job_queue.run_daily(nightly_digest, time=dtime(20, 0, 0, tzinfo=timezone.utc))
+
+    # New content commands
+    app.add_handler(CommandHandler("references", cmd_references))
+    app.add_handler(CommandHandler("ideas",      cmd_ideas))
+    app.add_handler(CommandHandler("journal",    cmd_journal))
+    app.add_handler(CommandHandler("search",     cmd_search))
+    app.add_handler(CommandHandler("digest",     cmd_digest))
+
+    # Voice / audio messages
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    # Photos and image documents
+    app.add_handler(MessageHandler(
+        filters.PHOTO | (filters.Document.IMAGE),
+        handle_photo,
+    ))
+
+    # Plain text outside conversations (NL classification + URL capture)
+    # Registered last so conversation handlers get first pick
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
     logger.info("🤖 Bot started!")
     app.run_polling(drop_pending_updates=True)
