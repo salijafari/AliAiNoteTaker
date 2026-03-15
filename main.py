@@ -8,6 +8,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ConversationHandler,
     filters,
     ContextTypes,
@@ -42,7 +43,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TASK_VIEW_LIST,
     TASK_EDIT_CONTENT,
     TASK_EDIT_DEADLINE,
-) = range(13)
+    CHATPROJECTS_PICK_ACTION,
+) = range(14)
 
 # Keys stored in context.user_data during flows
 _FLOW           = "flow"
@@ -51,16 +53,17 @@ _PENDING        = "pending_tasks"
 _NOTE_IDS       = "selected_note_ids"
 _SUGGESTED_IDS  = "selected_suggested_ids"
 _EDIT_TASK_ID   = "edit_task_id"
+_CHAT_OWNER_ID  = "chat_owner_id"
+_CHAT_ID_KEY    = "chat_id_flow"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _project_keyboard(projects: list, extra_buttons: list[list] | None = None):
-    """Build an inline keyboard of project buttons + '+ Create Project'."""
+def _project_keyboard(projects: list, show_create: bool = True):
+    """Build an inline keyboard of project buttons + optional '+ Create Project'."""
     kb = [[InlineKeyboardButton(p["name"], callback_data=f"proj_{p['id']}")] for p in projects]
-    kb.append([InlineKeyboardButton("➕ Create Project", callback_data="proj_new")])
-    if extra_buttons:
-        kb.extend(extra_buttons)
+    if show_create:
+        kb.append([InlineKeyboardButton("➕ Create Project", callback_data="proj_new")])
     return InlineKeyboardMarkup(kb)
 
 
@@ -81,9 +84,64 @@ def _fmt_task(task: dict) -> str:
     return f"*#{task['id']}* {task['title']}{desc}{deadline}\n_{ts}{tags}_"
 
 
-async def _send_project_picker(update_or_query, user_id: int, prompt: str):
-    projects = db.get_projects(user_id)
-    kb = _project_keyboard(projects)
+async def _resolve_chat_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Determine the owner user_id and chat_id for the current interaction.
+
+    - Private chat: registers the chat, returns (user_id, chat_id).
+    - Group chat not set up: sends a setup message and returns None.
+    - Group chat set up: returns (owner_user_id, chat_id).
+    Stores _CHAT_OWNER_ID and _CHAT_ID_KEY in context.user_data.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id
+    user_id = user.id
+
+    if chat.type == "private":
+        db.register_chat(chat_id, "private", user.full_name, user_id)
+        context.user_data[_CHAT_OWNER_ID] = user_id
+        context.user_data[_CHAT_ID_KEY]   = chat_id
+        return (user_id, chat_id)
+
+    # Group / supergroup
+    chat_record = db.get_chat(chat_id)
+    if not chat_record or not chat_record["setup_complete"]:
+        msg = (
+            "⚠️ This chat hasn't been set up yet.\n"
+            "An admin must run /chatprojects to configure which projects are accessible here."
+        )
+        if update.message:
+            await update.message.reply_text(msg)
+        elif update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        return None
+
+    owner_id = chat_record["created_by_user_id"]
+    context.user_data[_CHAT_OWNER_ID] = owner_id
+    context.user_data[_CHAT_ID_KEY]   = chat_id
+    return (owner_id, chat_id)
+
+
+async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def _send_project_picker(update_or_query, user_id: int, prompt: str, chat_id: int = None):
+    projects  = db.get_projects(user_id)
+    in_group  = False
+
+    if chat_id:
+        chat_record = db.get_chat(chat_id)
+        if chat_record and chat_record["chat_type"] != "private":
+            in_group = True
+            allowed  = {p["id"] for p in db.get_chat_projects(chat_id)}
+            projects = [p for p in projects if p["id"] in allowed]
+
+    kb = _project_keyboard(projects, show_create=not in_group)
     if hasattr(update_or_query, "message") and update_or_query.message:
         await update_or_query.message.reply_text(prompt, reply_markup=kb, parse_mode="Markdown")
     else:
@@ -110,16 +168,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def note_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[_FLOW] = "note"
-    user_id = update.effective_user.id
-    projects = db.get_projects(user_id)
-    await _send_project_picker(update, user_id, "📝 *New note — pick a project:*")
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return ConversationHandler.END
+    user_id, chat_id = result
+    await _send_project_picker(update, user_id, "📝 *New note — pick a project:*", chat_id=chat_id)
     return NOTE_PICK_PROJECT
 
 
 async def note_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    user_id = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
 
     if query.data == "proj_new":
         context.user_data["after_newproject"] = "note"
@@ -127,12 +187,11 @@ async def note_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
         return NEWPROJECT_AWAIT_NAME
 
     project_id = int(query.data.split("_")[1])
-    project = db.get_project(project_id, user_id)
+    project    = db.get_project(project_id, user_id)
     context.user_data[_PROJECT_ID] = project_id
 
-    # Show recent notes for this project, then ask for new note
     notes = db.get_notes(user_id, project_id, limit=5)
-    text = f"📂 *{project['name']}*\n\n"
+    text  = f"📂 *{project['name']}*\n\n"
     if notes:
         text += "_Recent notes:_\n"
         for n in notes:
@@ -146,8 +205,8 @@ async def note_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def note_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id   = update.effective_user.id
-    raw_text  = update.message.text.strip()
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    raw_text   = update.message.text.strip()
     project_id = context.user_data.get(_PROJECT_ID)
 
     if not project_id:
@@ -181,15 +240,18 @@ async def note_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[_FLOW] = "task"
-    user_id = update.effective_user.id
-    await _send_project_picker(update, user_id, "✅ *New task — pick a project:*")
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return ConversationHandler.END
+    user_id, chat_id = result
+    await _send_project_picker(update, user_id, "✅ *Tasks — pick a project:*", chat_id=chat_id)
     return TASK_PICK_PROJECT
 
 
 async def task_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    user_id = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
 
     if query.data == "proj_new":
         context.user_data["after_newproject"] = "task"
@@ -197,7 +259,7 @@ async def task_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
         return NEWPROJECT_AWAIT_NAME
 
     project_id = int(query.data.split("_")[1])
-    project = db.get_project(project_id, user_id)
+    project    = db.get_project(project_id, user_id)
     context.user_data[_PROJECT_ID] = project_id
 
     kb = InlineKeyboardMarkup([
@@ -216,7 +278,7 @@ async def task_project_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def task_mode_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query      = update.callback_query
     await query.answer()
-    user_id    = query.from_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
     project_id = context.user_data[_PROJECT_ID]
     project    = db.get_project(project_id, user_id)
 
@@ -267,9 +329,9 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return TASK_PICK_NOTES
         await query.answer()
 
-        user_id    = query.from_user.id
-        project_id = context.user_data[_PROJECT_ID]
-        project    = db.get_project(project_id, user_id)
+        user_id     = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
+        project_id  = context.user_data[_PROJECT_ID]
+        project     = db.get_project(project_id, user_id)
         notes_cache = context.user_data.get("notes_cache", {})
         selected_notes = [notes_cache[nid] for nid in selected_ids if nid in notes_cache]
 
@@ -283,7 +345,7 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         context.user_data[_PENDING]       = tasks
-        context.user_data[_SUGGESTED_IDS] = list(range(len(tasks)))  # all selected by default
+        context.user_data[_SUGGESTED_IDS] = list(range(len(tasks)))
 
         text = f"🎯 *Claude found {len(tasks)} tasks for {project['name']}:*\n_Tap to deselect, then save._\n\n"
         kb   = []
@@ -299,7 +361,7 @@ async def task_note_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Toggle a note
     await query.answer()
-    note_id = int(query.data.split("_")[1])
+    note_id  = int(query.data.split("_")[1])
     selected = context.user_data.setdefault(_NOTE_IDS, [])
     if note_id in selected:
         selected.remove(note_id)
@@ -330,7 +392,7 @@ async def task_suggested_toggle(update: Update, context: ContextTypes.DEFAULT_TY
             return TASK_REVIEW_SUGGESTED
         await query.answer()
 
-        user_id    = query.from_user.id
+        user_id    = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
         project_id = context.user_data[_PROJECT_ID]
         pending    = context.user_data.get(_PENDING, [])
 
@@ -369,7 +431,7 @@ async def task_suggested_toggle(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def task_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id    = update.effective_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
     raw_text   = update.message.text.strip()
     project_id = context.user_data.get(_PROJECT_ID)
 
@@ -410,8 +472,8 @@ def _build_task_list_kb(tasks):
     kb = []
     for t in tasks:
         kb.append([
-            InlineKeyboardButton(f"✅ Done", callback_data=f"tv_done_{t['id']}"),
-            InlineKeyboardButton(f"✏️ Edit", callback_data=f"tv_edit_{t['id']}"),
+            InlineKeyboardButton("✅ Done", callback_data=f"tv_done_{t['id']}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"tv_edit_{t['id']}"),
         ])
     return kb
 
@@ -436,7 +498,7 @@ async def _show_tasks(send_fn, user_id, project_id, header=""):
 
 async def task_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query      = update.callback_query
-    user_id    = query.from_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
     project_id = context.user_data.get(_PROJECT_ID)
     data       = query.data
 
@@ -533,7 +595,7 @@ async def task_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def task_edit_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id    = update.effective_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
     raw_text   = update.message.text.strip()
     task_id    = context.user_data.get(_EDIT_TASK_ID)
     project_id = context.user_data.get(_PROJECT_ID)
@@ -566,7 +628,7 @@ async def task_edit_content_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def task_edit_deadline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id    = update.effective_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
     raw_text   = update.message.text.strip()
     task_id    = context.user_data.get(_EDIT_TASK_ID)
     project_id = context.user_data.get(_PROJECT_ID)
@@ -588,16 +650,18 @@ async def task_edit_deadline_handler(update: Update, context: ContextTypes.DEFAU
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def project_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    projects = db.get_projects(user_id)
-    await _send_project_picker(update, user_id, "📂 *Your projects — pick one:*")
+    result = await _resolve_chat_context(update, context)
+    if result is None:
+        return ConversationHandler.END
+    user_id, chat_id = result
+    await _send_project_picker(update, user_id, "📂 *Your projects — pick one:*", chat_id=chat_id)
     return PROJECT_PICK
 
 
 async def project_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    user_id = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
 
     if query.data == "proj_new":
         context.user_data["after_newproject"] = "project"
@@ -626,10 +690,10 @@ async def project_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def project_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query      = update.callback_query
     await query.answer()
-    user_id    = query.from_user.id
+    user_id    = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
     project_id = context.user_data[_PROJECT_ID]
     project    = db.get_project(project_id, user_id)
-    action     = query.data  # e.g. "paction_notes"
+    action     = query.data
 
     if action == "paction_notes":
         notes = db.get_notes(user_id, project_id)
@@ -659,7 +723,6 @@ async def project_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 *Add note to {project['name']}:*\n_Hashtags like #vendor will be saved as tags._",
             parse_mode="Markdown",
         )
-        # re-use NOTE_AWAIT_TEXT state
         return NOTE_AWAIT_TEXT
 
     if action == "paction_addtask":
@@ -678,7 +741,7 @@ async def project_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        context.user_data[_NOTE_IDS]    = []
+        context.user_data[_NOTE_IDS]     = []
         context.user_data["notes_cache"] = {n["id"]: n for n in notes}
         kb = [
             [InlineKeyboardButton(
@@ -703,7 +766,8 @@ async def show_raw_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     note_id = int(query.data.split("_")[1])
-    note    = db.get_note(note_id, query.from_user.id)
+    user_id = context.user_data.get(_CHAT_OWNER_ID, query.from_user.id)
+    note    = db.get_note(note_id, user_id)
     if not note:
         await query.answer("Note not found.", show_alert=True)
         return
@@ -716,15 +780,14 @@ async def show_raw_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── New-project mid-flow ───────────────────────────────────────────────────────
 
 async def newproject_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    name     = update.message.text.strip()
-    after    = context.user_data.pop("after_newproject", None)
+    user_id = context.user_data.get(_CHAT_OWNER_ID, update.effective_user.id)
+    name    = update.message.text.strip()
+    after   = context.user_data.pop("after_newproject", None)
 
     project_id = db.create_project(user_id, name)
     context.user_data[_PROJECT_ID] = project_id
     await update.message.reply_text(f"🎉 Project *{name}* created!", parse_mode="Markdown")
 
-    # Resume the original flow
     if after == "note":
         await update.message.reply_text(
             f"✏️ *Type your note for {name}:*\n_Hashtags like #vendor will be saved as tags._",
@@ -761,6 +824,118 @@ async def newproject_receive_name(update: Update, context: ContextTypes.DEFAULT_
         return PROJECT_ACTION
 
     return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /chatprojects  flow  (groups only, admins only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def chatprojects_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text(
+            "ℹ️ /chatprojects only works in group chats.\n"
+            "In private chats all your projects are always accessible."
+        )
+        return ConversationHandler.END
+
+    if not await _is_chat_admin(update, context):
+        await update.message.reply_text("⛔ Only group admins can configure chat projects.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    chat_id = chat.id
+
+    db.register_chat(chat_id, chat.type, chat.title or "", user_id)
+
+    projects = db.get_projects(user_id)
+    if not projects:
+        await update.message.reply_text(
+            "You don't have any projects yet.\n"
+            "Create one in a private chat with /project first, then come back here."
+        )
+        return ConversationHandler.END
+
+    current = {p["id"] for p in db.get_chat_projects(chat_id)}
+    context.user_data["cp_owner_id"] = user_id
+    context.user_data["cp_selected"] = current
+
+    kb = _build_chatprojects_kb(projects, current)
+    await update.message.reply_text(
+        "📂 *Select projects accessible in this chat:*\n_Tap to toggle, then Save._",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return CHATPROJECTS_PICK_ACTION
+
+
+def _build_chatprojects_kb(projects, selected_ids):
+    kb = []
+    for p in projects:
+        checked = p["id"] in selected_ids
+        kb.append([InlineKeyboardButton(
+            f"{'☑️' if checked else '⬜'} {p['name']}",
+            callback_data=f"cp_toggle_{p['id']}"
+        )])
+    kb.append([InlineKeyboardButton("💾 Save", callback_data="cp_save")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def chatprojects_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    if query.data == "cp_save":
+        await query.answer()
+        chat_id  = update.effective_chat.id
+        selected = context.user_data.get("cp_selected", set())
+        db.set_chat_projects(chat_id, list(selected))
+        db.mark_chat_setup_complete(chat_id)
+        await query.edit_message_text(
+            f"✅ *Chat projects updated!*\n{len(selected)} project(s) are now accessible in this chat.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    # Toggle a project
+    await query.answer()
+    project_id = int(query.data.split("_")[2])
+    selected   = context.user_data.setdefault("cp_selected", set())
+    if project_id in selected:
+        selected.discard(project_id)
+    else:
+        selected.add(project_id)
+
+    owner_id = context.user_data.get("cp_owner_id")
+    projects = db.get_projects(owner_id)
+    await query.edit_message_reply_markup(reply_markup=_build_chatprojects_kb(projects, selected))
+    return CHATPROJECTS_PICK_ACTION
+
+
+# ── Bot added to group ────────────────────────────────────────────────────────
+
+async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when bot's status changes in a chat (e.g. added to a group)."""
+    new_status = update.my_chat_member.new_chat_member.status
+    if new_status not in ("member", "administrator"):
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user  # the user who added the bot
+
+    if chat.type == "private":
+        return  # handled by _resolve_chat_context on first command
+
+    db.register_chat(chat.id, chat.type, chat.title or "", user.id)
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "👋 Hi! I'm your AI note-taker bot.\n\n"
+                "An admin needs to run /chatprojects to choose which projects are accessible in this chat."
+            ),
+        )
+    except Exception as e:
+        logger.error(f"on_bot_added send error: {e}")
 
 
 # ── Task/reminder callbacks (outside conversation) ────────────────────────────
@@ -858,10 +1033,11 @@ async def check_deadline_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start",   "Welcome screen"),
-        BotCommand("note",    "Capture a note under a project"),
-        BotCommand("task",    "Create or convert tasks"),
-        BotCommand("project", "Browse and manage your projects"),
+        BotCommand("start",        "Welcome screen"),
+        BotCommand("note",         "Capture a note under a project"),
+        BotCommand("task",         "Create or convert tasks"),
+        BotCommand("project",      "Browse and manage your projects"),
+        BotCommand("chatprojects", "Configure projects accessible in this group (admins only)"),
     ])
 
 
@@ -876,8 +1052,8 @@ def main():
     note_conv = ConversationHandler(
         entry_points=[CommandHandler("note", note_entry)],
         states={
-            NOTE_PICK_PROJECT: [CallbackQueryHandler(note_project_chosen, pattern=r"^proj_")],
-            NOTE_AWAIT_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
+            NOTE_PICK_PROJECT:     [CallbackQueryHandler(note_project_chosen, pattern=r"^proj_")],
+            NOTE_AWAIT_TEXT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
             NEWPROJECT_AWAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
@@ -889,15 +1065,15 @@ def main():
     task_conv = ConversationHandler(
         entry_points=[CommandHandler("task", task_entry)],
         states={
-            TASK_PICK_PROJECT:    [CallbackQueryHandler(task_project_chosen, pattern=r"^proj_")],
-            TASK_PICK_MODE:       [CallbackQueryHandler(task_mode_chosen, pattern=r"^taskmode_")],
-            TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
-            TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
-            TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
-            TASK_VIEW_LIST:      [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
-            TASK_EDIT_CONTENT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
-            TASK_EDIT_DEADLINE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
-            NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
+            TASK_PICK_PROJECT:     [CallbackQueryHandler(task_project_chosen, pattern=r"^proj_")],
+            TASK_PICK_MODE:        [CallbackQueryHandler(task_mode_chosen, pattern=r"^taskmode_")],
+            TASK_AWAIT_TEXT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
+            TASK_PICK_NOTES:       [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
+            TASK_REVIEW_SUGGESTED: [CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            TASK_VIEW_LIST:        [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
+            TASK_EDIT_CONTENT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
+            TASK_EDIT_DEADLINE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
+            NEWPROJECT_AWAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
@@ -908,16 +1084,27 @@ def main():
     project_conv = ConversationHandler(
         entry_points=[CommandHandler("project", project_entry)],
         states={
-            PROJECT_PICK:         [CallbackQueryHandler(project_picked, pattern=r"^proj_")],
-            PROJECT_ACTION:       [CallbackQueryHandler(project_action, pattern=r"^paction_")],
-            NOTE_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
-            TASK_AWAIT_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
-            TASK_PICK_NOTES:      [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
-            TASK_REVIEW_SUGGESTED:[CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
-            TASK_VIEW_LIST:      [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
-            TASK_EDIT_CONTENT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
-            TASK_EDIT_DEADLINE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
-            NEWPROJECT_AWAIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
+            PROJECT_PICK:          [CallbackQueryHandler(project_picked, pattern=r"^proj_")],
+            PROJECT_ACTION:        [CallbackQueryHandler(project_action, pattern=r"^paction_")],
+            NOTE_AWAIT_TEXT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, note_receive_text)],
+            TASK_AWAIT_TEXT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, task_receive_text)],
+            TASK_PICK_NOTES:       [CallbackQueryHandler(task_note_toggle, pattern=r"^picknote_")],
+            TASK_REVIEW_SUGGESTED: [CallbackQueryHandler(task_suggested_toggle, pattern=r"^stask_")],
+            TASK_VIEW_LIST:        [CallbackQueryHandler(task_view_handler, pattern=r"^tv_")],
+            TASK_EDIT_CONTENT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_content_handler)],
+            TASK_EDIT_DEADLINE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, task_edit_deadline_handler)],
+            NEWPROJECT_AWAIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newproject_receive_name)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        per_message=False,
+        allow_reentry=True,
+    )
+
+    # /chatprojects conversation
+    chatproj_conv = ConversationHandler(
+        entry_points=[CommandHandler("chatprojects", chatprojects_entry)],
+        states={
+            CHATPROJECTS_PICK_ACTION: [CallbackQueryHandler(chatprojects_toggle, pattern=r"^cp_")],
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False,
@@ -928,8 +1115,12 @@ def main():
     app.add_handler(note_conv)
     app.add_handler(task_conv)
     app.add_handler(project_conv)
+    app.add_handler(chatproj_conv)
 
-    # Global callbacks not inside a conversation (done/remind/rawnote/savetask)
+    # Detect when bot is added to a group
+    app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Global callbacks not inside a conversation (done/remind/rawnote)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.job_queue.run_repeating(check_reminders, interval=60, first=15)

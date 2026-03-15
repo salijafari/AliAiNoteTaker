@@ -110,6 +110,31 @@ def init_db():
             if not _column_exists(conn, 'tasks', col):
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
 
+        # ── Chat / multi-chat support tables ───────────────────────────────────
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS chats (
+                id                  INTEGER PRIMARY KEY,
+                chat_type           TEXT    NOT NULL,
+                title               TEXT,
+                created_by_user_id  INTEGER NOT NULL,
+                setup_complete      INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_projects (
+                chat_id     INTEGER NOT NULL,
+                project_id  INTEGER NOT NULL,
+                UNIQUE(chat_id, project_id),
+                FOREIGN KEY (chat_id)    REFERENCES chats(id),
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            );
+        ''')
+
+        # ── Migrate notes/tasks to add chat_id column ─────────────────────────
+        if not _column_exists(conn, 'notes', 'chat_id'):
+            conn.execute("ALTER TABLE notes ADD COLUMN chat_id INTEGER")
+        if not _column_exists(conn, 'tasks', 'chat_id'):
+            conn.execute("ALTER TABLE tasks ADD COLUMN chat_id INTEGER")
+
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 
@@ -262,3 +287,45 @@ def get_approaching_deadlines():
 def mark_deadline_reminded(task_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE tasks SET deadline_reminded = 1 WHERE id = ?", (task_id,))
+
+
+# ── Chats ─────────────────────────────────────────────────────────────────────
+
+def register_chat(chat_id: int, chat_type: str, title: str, created_by_user_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chats (id, chat_type, title, created_by_user_id) VALUES (?, ?, ?, ?)",
+            (chat_id, chat_type, title, created_by_user_id)
+        )
+
+
+def get_chat(chat_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def mark_chat_setup_complete(chat_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE chats SET setup_complete = 1 WHERE id = ?", (chat_id,))
+
+
+def get_chat_projects(chat_id: int):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT p.* FROM projects p "
+            "JOIN chat_projects cp ON cp.project_id = p.id "
+            "WHERE cp.chat_id = ? ORDER BY p.name",
+            (chat_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_chat_projects(chat_id: int, project_ids: list):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM chat_projects WHERE chat_id = ?", (chat_id,))
+        for pid in project_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO chat_projects (chat_id, project_id) VALUES (?, ?)",
+                (chat_id, pid)
+            )
